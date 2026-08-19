@@ -64,3 +64,4 @@ fastlane/test_output
 # XcodeGen output
 *.xcodeproj
 build/
+.DS_Store
