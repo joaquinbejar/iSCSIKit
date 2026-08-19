@@ -29,14 +29,17 @@ final class SessionPump: @unchecked Sendable {
     private var powerNotifier: io_object_t = 0
     private var powerRootPort: io_connect_t = 0
 
-    /// Connects every URL, registers targets 0..n-1 with the dext, and blocks
-    /// pumping tasks until SIGINT.
-    func run(urls: [String]) throws -> Never {
+    /// Connects every entry, registers targets 0..n-1 with the dext, and
+    /// blocks pumping tasks until SIGINT.
+    func run(entries: [DaemonConfig.TargetEntry]) throws -> Never {
         try queue.sync {
-            for (index, urlString) in urls.enumerated() {
+            for (index, entry) in entries.enumerated() {
                 let targetID = UInt64(index)
                 let initiator = try Initiator()
-                let url = try initiator.parseURL(urlString)
+                var url = try initiator.parseURL(entry.url)
+                if let user = entry.mutualUsername, let pass = entry.mutualPassword {
+                    url = url.withMutualCHAP(CHAPCredentials(username: user, password: pass))
+                }
                 try initiator.connect(to: url)
                 let device = try initiator.inquiry(lun: url.lun)
                 let capacity = try initiator.readCapacity(lun: url.lun)

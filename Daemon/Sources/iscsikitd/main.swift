@@ -7,6 +7,7 @@ import ISCSIKitCore
 //   iscsikitd info <iscsi-url>
 //   iscsikitd verify <iscsi-url>                     (raw READ(16) smoke test)
 //   iscsikitd serve <iscsi-url> [<iscsi-url>...]     (needs the dext installed)
+//   iscsikitd serve --config [path]                  (target list from JSON, for launchd)
 //
 // iscsi-url: iscsi://[user[%pass]@]host[:port]/target-iqn/lun
 // CHAP credentials travel inside the URL (or LIBISCSI_CHAP_USERNAME /
@@ -25,6 +26,7 @@ guard arguments.count >= 3 else {
       iscsikitd info <iscsi-url>
       iscsikitd verify <iscsi-url>
       iscsikitd serve <iscsi-url> [<iscsi-url>...]
+      iscsikitd serve --config [path]   (default: ~/Library/Application Support/iSCSIKit/targets.json)
 
     iscsi-url: iscsi://[user[%pass]@]host[:port]/target-iqn/lun
     mutual CHAP: LIBISCSI_CHAP_TARGET_USERNAME / LIBISCSI_CHAP_TARGET_PASSWORD
@@ -71,7 +73,17 @@ do {
         let zeros = result.dataIn.allSatisfy { $0 == 0 }
         print("READ(16) OK: \(result.dataIn.count) bytes from LBA 0\(zeros ? " (all zeros)" : "")")
     case "serve":
-        try SessionPump().run(urls: Array(arguments[2...]))
+        let entries: [DaemonConfig.TargetEntry]
+        if arguments[2] == "--config" {
+            let path = arguments.count > 3
+                ? URL(fileURLWithPath: arguments[3])
+                : DaemonConfig.defaultPath
+            entries = try DaemonConfig.load(from: path).targets
+            guard !entries.isEmpty else { fail("no targets in \(path.path)") }
+        } else {
+            entries = arguments[2...].map { DaemonConfig.TargetEntry(url: $0) }
+        }
+        try SessionPump().run(entries: entries)
     default:
         fail("unknown command: \(arguments[1])")
     }

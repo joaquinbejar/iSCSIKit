@@ -1,4 +1,5 @@
 import Foundation
+import ServiceManagement
 import os
 
 /// Launches and supervises one `iscsikitd serve` process for the configured
@@ -23,8 +24,12 @@ final class DaemonController: ObservableObject {
     private let logger = Logger(subsystem: "com.taunais.iscsikit", category: "DaemonController")
 
     init() {
-        daemonPath = UserDefaults.standard.string(forKey: "daemonPath")
-            ?? "/opt/homebrew/bin/iscsikitd"
+        let bundled = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/iscsikitd").path
+        let fallback = FileManager.default.isExecutableFile(atPath: bundled)
+            ? bundled
+            : "/opt/homebrew/bin/iscsikitd"
+        daemonPath = UserDefaults.standard.string(forKey: "daemonPath") ?? fallback
     }
 
     func start(urls: [String]) {
@@ -74,5 +79,31 @@ final class DaemonController: ObservableObject {
 
     func stop() {
         process?.interrupt()  // SIGINT: daemon unregisters targets and exits
+    }
+
+    // MARK: - launchd agent (daemon survives app quit, starts at login)
+
+    private let agent = SMAppService.agent(plistName: "com.taunais.iscsikit.daemon.plist")
+
+    var agentStatus: SMAppService.Status { agent.status }
+
+    func installAgent() {
+        do {
+            try agent.register()
+            logger.info("launch agent registered")
+        } catch {
+            state = .failed("agent install failed: \(error.localizedDescription)")
+        }
+        objectWillChange.send()
+    }
+
+    func removeAgent() {
+        do {
+            try agent.unregister()
+            logger.info("launch agent removed")
+        } catch {
+            state = .failed("agent removal failed: \(error.localizedDescription)")
+        }
+        objectWillChange.send()
     }
 }
