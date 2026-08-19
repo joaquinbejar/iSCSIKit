@@ -1,0 +1,5 @@
+module CLibISCSI [system] {
+    header "shim.h"
+    link "iscsi"
+    export *
+}

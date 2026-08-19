@@ -1,0 +1,64 @@
+name: iSCSIKit
+options:
+  bundleIdPrefix: com.taunais
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: 5NP3LPSUMR
+
+targets:
+  iSCSIKitDext:
+    type: driver-extension
+    platform: macOS
+    sources:
+      - path: Dext
+        includes:
+          - "*.iig"
+          - "*.cpp"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.taunais.iscsi-initiator.dext
+        PRODUCT_NAME: iSCSIKitDext
+        INFOPLIST_FILE: Dext/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: Dext/Dext.entitlements
+        HEADER_SEARCH_PATHS: $(SRCROOT)/Shared
+        SDKROOT: driverkit
+        DRIVERKIT_DEPLOYMENT_TARGET: "23.0"
+        OTHER_LDFLAGS: ["-framework", "SCSIControllerDriverKit"]
+
+  iSCSIKit:
+    type: application
+    platform: macOS
+    sources:
+      - App
+    dependencies:
+      - target: iSCSIKitDext
+        embed: true
+        codeSign: true
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: 1
+        LSMinimumSystemVersion: "15.0"
+        NSHumanReadableCopyright: "© 2026 Joaquin Bejar Garcia. MIT License."
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.taunais.iscsi-initiator
+        PRODUCT_NAME: iSCSIKit
+        CODE_SIGN_ENTITLEMENTS: App/App.entitlements
+        ENABLE_HARDENED_RUNTIME: true
+
+schemes:
+  iSCSIKit:
+    build:
+      targets:
+        iSCSIKit: all
+    run:
+      config: Debug
