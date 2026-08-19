@@ -7,6 +7,8 @@ struct ContentView: View {
 
     @State private var newName = ""
     @State private var newURL = ""
+    @State private var newMutualUser = ""
+    @State private var newMutualPass = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -55,10 +57,16 @@ struct ContentView: View {
                             .frame(width: 120)
                         TextField("iscsi://user%pass@host:3260/iqn…/0", text: $newURL)
                             .font(.body.monospaced())
+                    }
+                    HStack {
+                        TextField("Mutual CHAP user (optional)", text: $newMutualUser)
+                        SecureField("Mutual CHAP password", text: $newMutualPass)
                         Button("Add") {
-                            targetStore.add(name: newName, url: newURL)
-                            newName = ""
-                            newURL = ""
+                            targetStore.add(name: newName, url: newURL,
+                                            mutualUsername: newMutualUser,
+                                            mutualPassword: newMutualPass)
+                            newName = ""; newURL = ""
+                            newMutualUser = ""; newMutualPass = ""
                         }
                         .disabled(newName.isEmpty || !newURL.hasPrefix("iscsi://"))
                     }
@@ -82,6 +90,14 @@ struct ContentView: View {
                         Text("Path:")
                         TextField("iscsikitd path", text: $daemon.daemonPath)
                             .font(.caption.monospaced())
+                    }
+                    HStack {
+                        agentStatusView
+                        Spacer()
+                        Button("Install Login Agent") { daemon.installAgent() }
+                            .disabled(daemon.agentStatus == .enabled)
+                        Button("Remove Agent") { daemon.removeAgent() }
+                            .disabled(daemon.agentStatus != .enabled)
                     }
                     if !daemon.log.isEmpty {
                         ScrollView {
@@ -119,6 +135,22 @@ struct ContentView: View {
         case .failed(let message):
             Label(message, systemImage: "xmark.circle.fill")
                 .foregroundStyle(.red)
+        }
+    }
+
+    @ViewBuilder
+    private var agentStatusView: some View {
+        switch daemon.agentStatus {
+        case .enabled:
+            Label("Login agent installed", systemImage: "clock.badge.checkmark")
+                .foregroundStyle(.green)
+        case .requiresApproval:
+            Label("Approve agent in System Settings › Login Items",
+                  systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.orange)
+        default:
+            Label("No login agent", systemImage: "clock")
+                .foregroundStyle(.secondary)
         }
     }
 

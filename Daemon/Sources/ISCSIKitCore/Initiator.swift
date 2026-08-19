@@ -101,6 +101,20 @@ public final class Initiator {
         /// from LIBISCSI_CHAP_TARGET_USERNAME / LIBISCSI_CHAP_TARGET_PASSWORD.
         public let targetChap: CHAPCredentials?
 
+        public init(portal: String, target: String, lun: Int32,
+                    chap: CHAPCredentials?, targetChap: CHAPCredentials?) {
+            self.portal = portal
+            self.target = target
+            self.lun = lun
+            self.chap = chap
+            self.targetChap = targetChap
+        }
+
+        public func withMutualCHAP(_ credentials: CHAPCredentials?) -> TargetURL {
+            TargetURL(portal: portal, target: target, lun: lun,
+                      chap: chap, targetChap: credentials ?? targetChap)
+        }
+
         public var description: String { "\(target) lun \(lun) @ \(portal)" }
     }
 

@@ -81,7 +81,9 @@ missing link is loading the signed dext so the kernel starts sending CDBs.
 - [ ] Shared-memory rings (`UserProcessBundledParallelTasks` + mapped command/
       response buffers) instead of copy-per-IO — deliberately deferred until
       the copy path is validated end-to-end
-- [ ] launchd integration (daemon survives app quit / starts at login)
+- [x] launchd integration: the app bundles `iscsikitd` and a LaunchAgent
+      (`SMAppService`) — "Install Login Agent" keeps sessions alive across
+      app quits and reconnects at login, reading the shared target config
 
 > **Warning**: pre-alpha storage software. Do not point it at data you care
 > about, and never connect a second initiator to a LUN that is already
@@ -189,6 +191,13 @@ The app persists a target list and supervises the daemon for you:
 3. **Connect All** launches `iscsikitd serve` with every configured target;
    the panel shows the live daemon log. **Disconnect** sends SIGINT, which
    unregisters the targets and logs out.
+4. **Install Login Agent** registers the bundled daemon as a launchd agent
+   (`SMAppService`): sessions survive quitting the app and reconnect at
+   login. The agent runs `iscsikitd serve --config`, reading the same target
+   list the app writes to
+   `~/Library/Application Support/iSCSIKit/targets.json` (mutual CHAP
+   credentials included), and logs to `/tmp/iscsikitd.log`. **Remove Agent**
+   unregisters it.
 
 ## Project Layout
 
