@@ -97,6 +97,9 @@ public final class Initiator {
         public let target: String
         public let lun: Int32
         public let chap: CHAPCredentials?
+        /// Mutual CHAP: credentials the target must prove to us. Populated
+        /// from LIBISCSI_CHAP_TARGET_USERNAME / LIBISCSI_CHAP_TARGET_PASSWORD.
+        public let targetChap: CHAPCredentials?
 
         public var description: String { "\(target) lun \(lun) @ \(portal)" }
     }
@@ -110,8 +113,11 @@ public final class Initiator {
         let target = withUnsafeBytes(of: value.target) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
         let user = withUnsafeBytes(of: value.user) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
         let passwd = withUnsafeBytes(of: value.passwd) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
+        let targetUser = withUnsafeBytes(of: value.target_user) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
+        let targetPasswd = withUnsafeBytes(of: value.target_passwd) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
         let chap = user.isEmpty ? nil : CHAPCredentials(username: user, password: passwd)
-        return TargetURL(portal: portal, target: target, lun: value.lun, chap: chap)
+        let targetChap = targetUser.isEmpty ? nil : CHAPCredentials(username: targetUser, password: targetPasswd)
+        return TargetURL(portal: portal, target: target, lun: value.lun, chap: chap, targetChap: targetChap)
     }
 
     /// Full login to a target LUN. After this call succeeds, I/O methods are usable.
@@ -126,6 +132,9 @@ public final class Initiator {
     }
 
     public func connect(to url: TargetURL) throws {
+        if let mutual = url.targetChap {
+            try check(iscsi_set_target_username_pwd(context, mutual.username, mutual.password))
+        }
         try connect(portal: url.portal, target: url.target, lun: url.lun, chap: url.chap)
     }
 
