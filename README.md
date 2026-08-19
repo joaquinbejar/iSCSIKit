@@ -77,13 +77,13 @@ missing link is loading the signed dext so the kernel starts sending CDBs.
 - [x] Sleep/wake: IOKit power notifications force a reconnect on wake
 - [x] Configuration UI: target list persisted in the app, daemon lifecycle
       (start/stop/log) managed from the Daemon panel
+- [x] launchd integration: the app bundles `iscsikitd` and a LaunchAgent
+      (`SMAppService`) — "Install Login Agent" keeps sessions alive across
+      app quits and reconnects at login, reading the shared target config
 - [ ] First end-to-end test with loaded dext (`iscsikitd serve` + Disk Utility)
 - [ ] Shared-memory rings (`UserProcessBundledParallelTasks` + mapped command/
       response buffers) instead of copy-per-IO — deliberately deferred until
       the copy path is validated end-to-end
-- [x] launchd integration: the app bundles `iscsikitd` and a LaunchAgent
-      (`SMAppService`) — "Install Login Agent" keeps sessions alive across
-      app quits and reconnects at login, reading the shared target config
 
 > **Warning**: pre-alpha storage software. Do not point it at data you care
 > about, and never connect a second initiator to a LUN that is already
