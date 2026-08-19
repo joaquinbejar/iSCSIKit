@@ -5,6 +5,7 @@ import ISCSIKitCore
 //
 //   iscsikitd discover <portal>
 //   iscsikitd info <iscsi-url>
+//   iscsikitd verify <iscsi-url>                     (raw READ(16) smoke test)
 //   iscsikitd serve <iscsi-url> [<iscsi-url>...]     (needs the dext installed)
 //
 // iscsi-url: iscsi://[user[%pass]@]host[:port]/target-iqn/lun
@@ -22,9 +23,11 @@ guard arguments.count >= 3 else {
     usage:
       iscsikitd discover <portal>
       iscsikitd info <iscsi-url>
+      iscsikitd verify <iscsi-url>
       iscsikitd serve <iscsi-url> [<iscsi-url>...]
 
     iscsi-url: iscsi://[user[%pass]@]host[:port]/target-iqn/lun
+    mutual CHAP: LIBISCSI_CHAP_TARGET_USERNAME / LIBISCSI_CHAP_TARGET_PASSWORD
     """)
 }
 
