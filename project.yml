@@ -24,7 +24,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.taunais.iscsi-initiator.dext
-        PRODUCT_NAME: iSCSIKitDext
+        PRODUCT_NAME: com.taunais.iscsi-initiator.dext
         INFOPLIST_FILE: Dext/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: Dext/Dext.entitlements
@@ -71,9 +71,19 @@ targets:
           export PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig
           cd "$SRCROOT/Daemon"
           swift build -c release
-          mkdir -p "$CODESIGNING_FOLDER_PATH/Contents/MacOS"
+          mkdir -p "$CODESIGNING_FOLDER_PATH/Contents/MacOS" "$CODESIGNING_FOLDER_PATH/Contents/Frameworks"
           cp -f .build/release/iscsikitd "$CODESIGNING_FOLDER_PATH/Contents/MacOS/"
+          # Bundle libiscsi: hardened-runtime binaries cannot load Homebrew's
+          # ad-hoc-signed dylib (different team ID).
+          LIBISCSI=$(readlink -f /opt/homebrew/opt/libiscsi/lib/libiscsi.11.dylib)
+          cp -f "$LIBISCSI" "$CODESIGNING_FOLDER_PATH/Contents/Frameworks/libiscsi.11.dylib"
+          install_name_tool -change /opt/homebrew/opt/libiscsi/lib/libiscsi.11.dylib \
+            @executable_path/../Frameworks/libiscsi.11.dylib \
+            "$CODESIGNING_FOLDER_PATH/Contents/MacOS/iscsikitd" 2>/dev/null || true
           if [ "$CODE_SIGNING_ALLOWED" = "YES" ] && [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ]; then
+            codesign --force --options runtime \
+              --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
+              "$CODESIGNING_FOLDER_PATH/Contents/Frameworks/libiscsi.11.dylib"
             codesign --force --options runtime \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               "$CODESIGNING_FOLDER_PATH/Contents/MacOS/iscsikitd"

@@ -33,6 +33,11 @@ struct TaskSlot {
     SlotState state;
     SCSIUserParallelTask task;
     OSAction * completion;
+    // Data buffer for the task, fetched in UserProcessParallelTask — the
+    // only context where UserGetDataBuffer is legal to call.
+    IOBufferMemoryDescriptor * buffer;
+    uint64_t bufferAddress;
+    uint64_t bufferLength;
 };
 
 }  // namespace
@@ -122,6 +127,9 @@ void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
                 response.fServiceResponse = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
                 ParallelTaskCompletion(slot.completion, response);
                 OSSafeReleaseNULL(slot.completion);
+                OSSafeReleaseNULL(slot.buffer);
+                slot.bufferAddress = 0;
+                slot.bufferLength = 0;
                 slot.state = SlotState::free_;
             }
         }
@@ -189,22 +197,12 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
     }
     memcpy(bytes, &descriptor, sizeof(descriptor));
 
-    if (payloadLength > 0) {
-        IOBufferMemoryDescriptor * buffer = nullptr;
-        kern_return_t ret = UserGetDataBuffer(task.fTargetID,
-                                              task.fControllerTaskIdentifier,
-                                              &buffer);
-        if (ret != kIOReturnSuccess || !buffer) {
-            IOFree(bytes, totalLength);
-            return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
-        }
-        IOAddressSegment range = {};
-        buffer->GetAddressRange(&range);
-        uint64_t copyLength = payloadLength < range.length ? payloadLength : range.length;
+    if (payloadLength > 0 && found->bufferAddress != 0) {
+        uint64_t copyLength = payloadLength < found->bufferLength
+            ? payloadLength : found->bufferLength;
         memcpy(bytes + sizeof(descriptor),
-               reinterpret_cast<const void *>(range.address),
+               reinterpret_cast<const void *>(found->bufferAddress),
                copyLength);
-        buffer->release();
     }
 
     arguments->structureOutput = OSData::withBytes(bytes, totalLength);
@@ -235,26 +233,28 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     }
     SCSIUserParallelTask task = found->task;
     OSAction * completion = found->completion;
+    IOBufferMemoryDescriptor * buffer = found->buffer;
+    uint64_t bufferAddress = found->bufferAddress;
+    uint64_t bufferLength = found->bufferLength;
     found->completion = nullptr;
+    found->buffer = nullptr;
+    found->bufferAddress = 0;
+    found->bufferLength = 0;
     found->state = SlotState::free_;
     IOLockUnlock(ivars->lock);
 
-    // Read data comes back inline after the response header.
-    if (task.fTransferDirection == kISCSIKitRead && reply.bytesTransferred > 0) {
+    // Read data comes back inline after the response header; copy it into
+    // the task's buffer mapped when the task was queued.
+    if (task.fTransferDirection == kISCSIKitRead && reply.bytesTransferred > 0 &&
+        bufferAddress != 0) {
         uint64_t available = length - sizeof(ISCSIKitTaskResponse);
         uint64_t dataLength = reply.bytesTransferred < available ? reply.bytesTransferred : available;
-        IOBufferMemoryDescriptor * buffer = nullptr;
-        kern_return_t ret = UserGetDataBuffer(task.fTargetID, reply.taskID, &buffer);
-        if (ret == kIOReturnSuccess && buffer) {
-            IOAddressSegment range = {};
-            buffer->GetAddressRange(&range);
-            uint64_t copyLength = dataLength < range.length ? dataLength : range.length;
-            memcpy(reinterpret_cast<void *>(range.address),
-                   reinterpret_cast<const uint8_t *>(bytes) + sizeof(ISCSIKitTaskResponse),
-                   copyLength);
-            buffer->release();
-        }
+        uint64_t copyLength = dataLength < bufferLength ? dataLength : bufferLength;
+        memcpy(reinterpret_cast<void *>(bufferAddress),
+               reinterpret_cast<const uint8_t *>(bytes) + sizeof(ISCSIKitTaskResponse),
+               copyLength);
     }
+    OSSafeReleaseNULL(buffer);
 
     SCSIUserParallelResponse response = {};
     response.version = kScsiUserParallelTaskResponseCurrentVersion1;
@@ -263,12 +263,9 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     response.fCompletionStatus = static_cast<SCSITaskStatus>(reply.status);
     response.fServiceResponse = kSCSIServiceResponse_TASK_COMPLETE;
     response.fBytesTransferred = reply.bytesTransferred;
-    uint8_t senseLength = reply.senseLength;
-    if (senseLength > kMaxSenseBufferSize) {
-        senseLength = kMaxSenseBufferSize;
-    }
-    response.fSenseLength = senseLength;
-    memcpy(response.fSenseBuffer, reply.sense, senseLength);
+    // senseLength is uint8_t, so it always fits kMaxSenseBufferSize (256).
+    response.fSenseLength = reply.senseLength;
+    memcpy(response.fSenseBuffer, reply.sense, reply.senseLength);
 
     ParallelTaskCompletion(completion, response);
     OSSafeReleaseNULL(completion);
@@ -408,9 +405,26 @@ kern_return_t IMPL(iSCSIKitDext, UserStartController)
 
 kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
 {
+    // Fetch the data buffer here: UserGetDataBuffer is only legal inside
+    // UserProcessParallelTask. The slot keeps it until completion.
+    IOBufferMemoryDescriptor * buffer = nullptr;
+    IOAddressSegment range = {};
+    if (parallelRequest.fTransferDirection != kISCSIKitNoData &&
+        parallelRequest.fRequestedTransferCount > 0) {
+        kern_return_t ret = UserGetDataBuffer(parallelRequest.fTargetID,
+                                              parallelRequest.fControllerTaskIdentifier,
+                                              &buffer);
+        if (ret != kIOReturnSuccess || !buffer) {
+            *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+            return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+        }
+        buffer->GetAddressRange(&range);
+    }
+
     IOLockLock(ivars->lock);
     if (!ivars->userClient) {
         IOLockUnlock(ivars->lock);
+        OSSafeReleaseNULL(buffer);
         *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
         return kIOReturnNotReady;
     }
@@ -423,6 +437,7 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     }
     if (!slot) {
         IOLockUnlock(ivars->lock);
+        OSSafeReleaseNULL(buffer);
         *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
         return kIOReturnNoResources;
     }
@@ -430,6 +445,9 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     slot->task = parallelRequest;
     completion->retain();
     slot->completion = completion;
+    slot->buffer = buffer;
+    slot->bufferAddress = range.address;
+    slot->bufferLength = range.length;
     iSCSIKitUserClient * client = ivars->userClient;
     IOLockUnlock(ivars->lock);
 
