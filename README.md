@@ -57,8 +57,10 @@ it against the target with libiscsi's raw passthrough, and completes it back
 
 ## Status
 
-Functional skeleton, end-to-end data path implemented but not yet tested with
-a loaded dext (needs the DriverKit entitlements + a signed build).
+The entire userspace stack is implemented and verified against real hardware
+(an ASUSTOR NAS with mutual CHAP and header/data digests): discovery, login,
+capacity, and raw READ(16) through the same code path `serve` uses. The last
+missing link is loading the signed dext so the kernel starts sending CDBs.
 
 - [x] Project skeleton (XcodeGen + SwiftPM)
 - [x] Daemon: discovery (SendTargets), login, `READ CAPACITY(16)`, `INQUIRY`
@@ -112,6 +114,44 @@ xcodebuild -project iSCSIKit.xcodeproj -scheme iSCSIKit build
 
 ## Usage
 
+### Target URLs
+
+Everything is addressed with libiscsi-native iSCSI URLs:
+
+```
+iscsi://[<user>[%<password>]@]<host>[:<port>]/<target-iqn>/<lun>
+```
+
+CHAP credentials for the initiator travel inside the URL. For **mutual CHAP**
+(the target also authenticates itself to you), export the target's
+credentials as environment variables — libiscsi picks them up automatically:
+
+```sh
+export LIBISCSI_CHAP_TARGET_USERNAME=mutualuser
+export LIBISCSI_CHAP_TARGET_PASSWORD=mutualsecret
+```
+
+### Exploring targets (no driver needed)
+
+```sh
+# List every target a portal announces (SendTargets discovery)
+iscsikitd discover 192.168.1.10
+#   iqn.2004-04.com.example:target0
+#     portal: 192.168.1.10:3260,1
+
+# Log in and query one LUN: INQUIRY + READ CAPACITY(16)
+iscsikitd info 'iscsi://chapuser%secret@192.168.1.10:3260/iqn.2004-04.com.example:target0/0'
+#   device: EXAMPLE iSCSI Storage
+#   capacity: 8589934592 blocks x 512 B = 4096.0 GiB
+
+# Smoke-test the raw data path: READ(16) of LBA 0 through the exact
+# execute() path `serve` uses
+iscsikitd verify 'iscsi://chapuser%secret@192.168.1.10:3260/iqn.2004-04.com.example:target0/0'
+#   READ(16) OK: 4096 bytes from LBA 0
+```
+
+### Bridging LUNs as disks (driver required)
+
 ```sh
 # 1. Allow development-signed driver extensions (once)
 systemextensionsctl developer on
@@ -119,17 +159,36 @@ systemextensionsctl developer on
 # 2. Launch the app, click "Install Driver", approve it in
 #    System Settings › General › Login Items & Extensions
 
-# 3. Explore the target (iscsi-url: iscsi://[user[%pass]@]host[:port]/iqn/lun)
-iscsikitd discover 192.168.1.10
-iscsikitd info iscsi://192.168.1.10:3260/iqn.2004-04.com.example:target0/0
+# 3. Bridge one or several LUNs — each appears as a disk in Disk Utility.
+#    Multi-target: pass N URLs, they become SCSI targets 0..N-1.
+iscsikitd serve \
+  'iscsi://chapuser%secret@192.168.1.10/iqn.2004-04.com.example:target0/0' \
+  'iscsi://192.168.1.11/iqn.2004-04.com.example:target1/0'
+#   target 0: EXAMPLE iSCSI Storage — iqn…target0 lun 0 @ 192.168.1.10:3260, 4096.0 GiB
+#   target 1: EXAMPLE iSCSI Storage — iqn…target1 lun 0 @ 192.168.1.11:3260, 512.0 GiB
+#   2 target(s) registered — LUNs should appear as disks
 
-# 4. Bridge LUNs — they appear as disks in Disk Utility
-iscsikitd serve iscsi://192.168.1.10/iqn.2004-04.com.example:target0/0 \
-                iscsi://chapuser%secret@192.168.1.11/iqn.2004-04.com.example:target1/0
-
-# Or manage everything from the app: add targets in the Targets panel and
-# click "Connect All".
+# Ctrl-C unregisters the targets and logs out cleanly.
 ```
+
+While `serve` runs it also handles the ugly parts for you:
+
+- **Transport errors** trigger one transparent reconnect + retry per task
+  (`iscsi_force_reconnect_sync`), so a flaky switch doesn't surface as an
+  I/O error to the filesystem.
+- **Sleep/wake**: the daemon subscribes to IOKit power notifications, never
+  vetoes sleep, and force-reconnects every session when the system wakes.
+
+### Managing targets from the app
+
+The app persists a target list and supervises the daemon for you:
+
+1. Add targets in the **Targets** panel (name + iSCSI URL).
+2. Point the **Daemon** panel at your `iscsikitd` binary (defaults to
+   `/opt/homebrew/bin/iscsikitd`).
+3. **Connect All** launches `iscsikitd serve` with every configured target;
+   the panel shows the live daemon log. **Disconnect** sends SIGINT, which
+   unregisters the targets and logs out.
 
 ## Project Layout
 
