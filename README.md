@@ -67,7 +67,9 @@ a loaded dext (needs the DriverKit entitlements + a signed build).
 - [x] Dext: task queue, target registry, data buffer copy in/out
 - [x] Daemon: raw CDB passthrough (`iscsikitd serve` pumps kernel CDBs to the
       target over libiscsi)
-- [x] CHAP (embedded in iSCSI URLs, libiscsi-native format)
+- [x] CHAP, including mutual (URL carries initiator credentials;
+      `LIBISCSI_CHAP_TARGET_USERNAME/PASSWORD` carry the target's), verified
+      against real hardware with header/data digests enabled
 - [x] Multi-session: `iscsikitd serve` bridges several targets at once
 - [x] Reconnection: transparent reconnect + retry on transport errors
 - [x] Sleep/wake: IOKit power notifications force a reconnect on wake
