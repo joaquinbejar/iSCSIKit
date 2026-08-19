@@ -54,9 +54,15 @@ final class SessionPump: @unchecked Sendable {
                 self?.handleTask(taskID)
             }
             try dext.registerCallback()
-            for targetID in sessions.keys.sorted() {
-                try dext.registerTarget(targetID)
-            }
+        }
+
+        // Register targets OFF the pump queue: UserCreateTargetForID blocks in
+        // the kernel until the target's initial probe (INQUIRY…) completes,
+        // and those probe CDBs are served by the pump. Registering from the
+        // pump queue deadlocks the whole stack.
+        guard let dext else { throw DextClientError.serviceNotFound }
+        for targetID in sessions.keys.sorted() {
+            try dext.registerTarget(targetID)
         }
         print("\(sessions.count) target(s) registered — LUNs should appear as disks")
 
