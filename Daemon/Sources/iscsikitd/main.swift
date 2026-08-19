@@ -48,6 +48,25 @@ do {
         let gib = Double(capacity.bytes) / 1_073_741_824
         print("device: \(device)")
         print("capacity: \(capacity.blocks) blocks x \(capacity.blockSize) B = \(String(format: "%.1f", gib)) GiB")
+    case "verify":
+        // Exercises the exact raw-CDB path `serve` uses: READ(16) of LBA 0.
+        let initiator = try Initiator()
+        let url = try initiator.parseURL(arguments[2])
+        try initiator.connect(to: url)
+        defer { initiator.disconnect() }
+        let capacity = try initiator.readCapacity(lun: url.lun)
+        var cdb = [UInt8](repeating: 0, count: 16)
+        cdb[0] = 0x88  // READ(16)
+        let blocks: UInt32 = 8
+        withUnsafeBytes(of: UInt32(blocks).bigEndian) { cdb.replaceSubrange(10..<14, with: $0) }
+        let result = try initiator.execute(
+            lun: url.lun, cdb: Data(cdb), direction: .read,
+            transferLength: blocks * capacity.blockSize)
+        guard result.status == 0 else {
+            fail("READ(16) failed: status 0x\(String(result.status, radix: 16)), sense \(result.sense.map { String(format: "%02x", $0) }.joined())")
+        }
+        let zeros = result.dataIn.allSatisfy { $0 == 0 }
+        print("READ(16) OK: \(result.dataIn.count) bytes from LBA 0\(zeros ? " (all zeros)" : "")")
     case "serve":
         try SessionPump().run(urls: Array(arguments[2...]))
     default:
