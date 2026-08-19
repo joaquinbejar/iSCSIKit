@@ -1,6 +1,6 @@
 [![License](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%2015%2B%20(Apple%20Silicon)-lightgrey)](https://developer.apple.com/documentation/driverkit)
-[![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange)](https://swift.org)
+[![Swift](https://img.shields.io/badge/Swift-6.0%2B-orange)](https://swift.org)
 [![Stars](https://img.shields.io/github/stars/joaquinbejar/iSCSIKit.svg)](https://github.com/joaquinbejar/iSCSIKit/stargazers)
 [![Issues](https://img.shields.io/github/issues/joaquinbejar/iSCSIKit.svg)](https://github.com/joaquinbejar/iSCSIKit/issues)
 [![PRs](https://img.shields.io/github/issues-pr/joaquinbejar/iSCSIKit.svg)](https://github.com/joaquinbejar/iSCSIKit/pulls)
@@ -67,12 +67,17 @@ a loaded dext (needs the DriverKit entitlements + a signed build).
 - [x] Dext: task queue, target registry, data buffer copy in/out
 - [x] Daemon: raw CDB passthrough (`iscsikitd serve` pumps kernel CDBs to the
       target over libiscsi)
+- [x] CHAP (embedded in iSCSI URLs, libiscsi-native format)
+- [x] Multi-session: `iscsikitd serve` bridges several targets at once
+- [x] Reconnection: transparent reconnect + retry on transport errors
+- [x] Sleep/wake: IOKit power notifications force a reconnect on wake
+- [x] Configuration UI: target list persisted in the app, daemon lifecycle
+      (start/stop/log) managed from the Daemon panel
 - [ ] First end-to-end test with loaded dext (`iscsikitd serve` + Disk Utility)
-- [ ] CHAP in `serve` (core supports it; CLI flag missing)
-- [ ] Reconnection, multi-session, sleep/wake handling
-- [ ] Shared-memory rings (`UserProcessBundledParallelTasks`) instead of
-      copy-per-IO
-- [ ] Configuration UI (targets live only in the CLI for now)
+- [ ] Shared-memory rings (`UserProcessBundledParallelTasks` + mapped command/
+      response buffers) instead of copy-per-IO — deliberately deferred until
+      the copy path is validated end-to-end
+- [ ] launchd integration (daemon survives app quit / starts at login)
 
 > **Warning**: pre-alpha storage software. Do not point it at data you care
 > about, and never connect a second initiator to a LUN that is already
@@ -112,12 +117,16 @@ systemextensionsctl developer on
 # 2. Launch the app, click "Install Driver", approve it in
 #    System Settings › General › Login Items & Extensions
 
-# 3. Explore the target
+# 3. Explore the target (iscsi-url: iscsi://[user[%pass]@]host[:port]/iqn/lun)
 iscsikitd discover 192.168.1.10
-iscsikitd info 192.168.1.10:3260 iqn.2004-04.com.example:target0 0
+iscsikitd info iscsi://192.168.1.10:3260/iqn.2004-04.com.example:target0/0
 
-# 4. Bridge a LUN — it appears as a disk in Disk Utility
-iscsikitd serve 192.168.1.10:3260 iqn.2004-04.com.example:target0 0
+# 4. Bridge LUNs — they appear as disks in Disk Utility
+iscsikitd serve iscsi://192.168.1.10/iqn.2004-04.com.example:target0/0 \
+                iscsi://chapuser%secret@192.168.1.11/iqn.2004-04.com.example:target1/0
+
+# Or manage everything from the app: add targets in the Targets panel and
+# click "Connect All".
 ```
 
 ## Project Layout
@@ -130,7 +139,7 @@ Daemon/                     SwiftPM package
   Sources/CLibISCSI/          libiscsi system-library shim
   Sources/CISCSIKitShared/    wire protocol shared with the dext
   Sources/ISCSIKitCore/       Swift iSCSI session wrapper
-  Sources/iscsikitd/          CLI daemon + IOKit client + task pump
+  Sources/iscsikitd/          CLI daemon + IOKit client + session pump
   Tests/                      unit tests
 ```
 

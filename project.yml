@@ -7,7 +7,8 @@ options:
 
 settings:
   base:
-    SWIFT_VERSION: "5.9"
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
     CODE_SIGN_STYLE: Automatic
     DEVELOPMENT_TEAM: 5NP3LPSUMR
 
@@ -27,7 +28,7 @@ targets:
         INFOPLIST_FILE: Dext/Info.plist
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: Dext/Dext.entitlements
-        HEADER_SEARCH_PATHS: $(SRCROOT)/Shared
+        HEADER_SEARCH_PATHS: $(SRCROOT)/Daemon/Sources/CISCSIKitShared/include
         SDKROOT: driverkit
         DRIVERKIT_DEPLOYMENT_TARGET: "23.0"
         OTHER_LDFLAGS: ["-framework", "SCSIControllerDriverKit"]
