@@ -91,6 +91,29 @@ public final class Initiator {
 
     // MARK: - Session
 
+    /// Components of an `iscsi://[user[%pass]@]host[:port]/target-iqn/lun` URL.
+    public struct TargetURL: Sendable {
+        public let portal: String
+        public let target: String
+        public let lun: Int32
+        public let chap: CHAPCredentials?
+
+        public var description: String { "\(target) lun \(lun) @ \(portal)" }
+    }
+
+    /// Parses a full iSCSI URL with libiscsi's own parser.
+    public func parseURL(_ url: String) throws -> TargetURL {
+        guard let parsed = iscsi_parse_full_url(context, url) else { throw lastError() }
+        defer { iscsi_destroy_url(parsed) }
+        let value = parsed.pointee
+        let portal = withUnsafeBytes(of: value.portal) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
+        let target = withUnsafeBytes(of: value.target) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
+        let user = withUnsafeBytes(of: value.user) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
+        let passwd = withUnsafeBytes(of: value.passwd) { String(decoding: $0.prefix(while: { $0 != 0 }), as: UTF8.self) }
+        let chap = user.isEmpty ? nil : CHAPCredentials(username: user, password: passwd)
+        return TargetURL(portal: portal, target: target, lun: value.lun, chap: chap)
+    }
+
     /// Full login to a target LUN. After this call succeeds, I/O methods are usable.
     public func connect(portal: String, target: String, lun: Int32,
                         chap: CHAPCredentials? = nil) throws {
@@ -100,6 +123,16 @@ public final class Initiator {
             try check(iscsi_set_initiator_username_pwd(context, chap.username, chap.password))
         }
         try check(iscsi_full_connect_sync(context, portal, lun))
+    }
+
+    public func connect(to url: TargetURL) throws {
+        try connect(portal: url.portal, target: url.target, lun: url.lun, chap: url.chap)
+    }
+
+    /// Tears down the TCP session and logs in again. Used after network
+    /// errors and system wake.
+    public func reconnect() throws {
+        try check(iscsi_force_reconnect_sync(context))
     }
 
     public func disconnect() {
