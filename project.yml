@@ -88,6 +88,7 @@ targets:
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               "$CODESIGNING_FOLDER_PATH/Contents/Frameworks/libiscsi.11.dylib"
             codesign --force --options runtime \
+              --identifier com.taunais.iscsi-initiator.daemon \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               "$CODESIGNING_FOLDER_PATH/Contents/MacOS/iscsikitd"
           fi
