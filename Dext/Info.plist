@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>DEXT</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.1.1</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>4</string>
 	<key>OSBundleUsageDescription</key>
 	<string>iSCSIKit virtual SCSI host bus adapter. Presents iSCSI LUNs as local disks.</string>
 	<key>IOKitPersonalities</key>
@@ -27,7 +27,7 @@
 			<key>CFBundleIdentifier</key>
 			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 			<key>CFBundleIdentifierKernel</key>
-			<string>com.apple.kpi.iokit</string>
+			<string>com.apple.iokit.IOSCSIParallelFamily</string>
 			<key>IOClass</key>
 			<string>IOUserSCSIParallelInterfaceController</string>
 			<key>IOUserClass</key>
