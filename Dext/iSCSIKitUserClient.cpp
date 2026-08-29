@@ -3,6 +3,7 @@
 #include <os/log.h>
 #include <string.h>
 #include <DriverKit/IOLib.h>
+#include <DriverKit/IODispatchQueue.h>
 #include <DriverKit/OSData.h>
 #include "iSCSIKitDext.h"
 #include "iSCSIKitUserClient.h"
@@ -37,6 +38,24 @@ kern_return_t IMPL(iSCSIKitUserClient, Start)
 {
     kern_return_t ret = Start(provider, SUPERDISPATCH);
     if (ret != kIOReturnSuccess) {
+        return ret;
+    }
+
+    // ExternalMethod carries QUEUENAME(IOUserClientQueueExternalMethod): give
+    // it a dedicated serial queue. Without it, external methods dispatch on
+    // the controller's Default queue and any synchronous framework call that
+    // needs kernel->dext callbacks (UserCreateTargetForID, probe I/O)
+    // deadlocks the whole stack.
+    IODispatchQueue * methodQueue = nullptr;
+    ret = IODispatchQueue::Create("IOUserClientQueueExternalMethod", 0, 0, &methodQueue);
+    if (ret != kIOReturnSuccess || !methodQueue) {
+        LOG("failed to create external-method queue: 0x%x", ret);
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    }
+    ret = SetDispatchQueue("IOUserClientQueueExternalMethod", methodQueue);
+    methodQueue->release();
+    if (ret != kIOReturnSuccess) {
+        LOG("failed to set external-method queue: 0x%x", ret);
         return ret;
     }
     ivars->controller = OSDynamicCast(iSCSIKitDext, provider);

@@ -113,10 +113,15 @@ kern_return_t IMPL(iSCSIKitDext, NewUserClient)
 
 void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
 {
+    // Collect outstanding work under the lock; complete outside it. Kernel
+    // RPCs must never run while holding the slot lock.
+    OSAction * completions[kMaxTaskCount] = {};
+    SCSIUserParallelResponse responses[kMaxTaskCount] = {};
+    uint32_t failCount = 0;
+
     IOLockLock(ivars->lock);
     ivars->userClient = client;
     if (!client) {
-        // Daemon went away: fail everything outstanding.
         for (auto & slot : ivars->slots) {
             if (slot.state != SlotState::free_) {
                 SCSIUserParallelResponse response = {};
@@ -125,8 +130,10 @@ void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
                 response.fControllerTaskIdentifier = slot.task.fControllerTaskIdentifier;
                 response.fCompletionStatus = kSCSITaskStatus_DeviceNotPresent;
                 response.fServiceResponse = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
-                ParallelTaskCompletion(slot.completion, response);
-                OSSafeReleaseNULL(slot.completion);
+                completions[failCount] = slot.completion;
+                responses[failCount] = response;
+                failCount++;
+                slot.completion = nullptr;
                 OSSafeReleaseNULL(slot.buffer);
                 slot.bufferAddress = 0;
                 slot.bufferLength = 0;
@@ -135,6 +142,11 @@ void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
         }
     }
     IOLockUnlock(ivars->lock);
+
+    for (uint32_t i = 0; i < failCount; i++) {
+        ParallelTaskCompletion(completions[i], responses[i]);
+        OSSafeReleaseNULL(completions[i]);
+    }
 }
 
 kern_return_t iSCSIKitDext::DaemonRegisterTarget(uint64_t targetID)
