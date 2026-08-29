@@ -17,7 +17,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.1</string>
 	<key>CFBundleVersion</key>
-	<string>4</string>
+	<string>6</string>
 	<key>OSBundleUsageDescription</key>
 	<string>iSCSIKit virtual SCSI host bus adapter. Presents iSCSI LUNs as local disks.</string>
 	<key>IOKitPersonalities</key>
