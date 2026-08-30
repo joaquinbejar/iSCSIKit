@@ -22,12 +22,9 @@
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "iSCSIKitDext: " fmt, ##__VA_ARGS__)
 
 static constexpr uint32_t kMaxTaskCount = 64;
-// Clamped to one 4KB chunk per task: UserGetDataBuffer only works for
-// transfers the kernel bounce-buffers (sub-page); larger I/O arrives as
-// direct user-page mappings it cannot hand us. The kernel splits all I/O
-// to this size. Slow but correct; the bundled shared-buffer path is the
-// planned fast replacement.
-static constexpr uint64_t kMaxTransferSize = 4096;
+// One Apple Silicon page per task, with internally consistent constraints
+// (single segment of exactly this size) while the write path is validated.
+static constexpr uint64_t kMaxTransferSize = 16384;
 
 namespace {
 
@@ -52,7 +49,10 @@ struct TaskSlot {
     // never pre-filled for writes.
     uint64_t bufferIOVA;
     uint16_t firstNonzeroOffset;
-    IODMACommand * dma;
+    // Write payload captured inside UserProcessParallelTask (the documented
+    // context for UserGetDataBuffer) so later stages never touch the buffer.
+    uint8_t * staged;
+    uint64_t stagedLength;
 };
 
 }  // namespace
@@ -60,6 +60,7 @@ struct TaskSlot {
 struct iSCSIKitDext_IVars {
     IOLock * lock;
     iSCSIKitUserClient * userClient;  // not retained; cleared on client Stop
+    uint64_t activeTaskIDs;  // bitmap, task IDs 1..64; duplicate detection
     TaskSlot slots[kMaxTaskCount];
     // Target create/destroy run here, never on an RPC dispatch queue:
     // UserCreateTargetForID blocks until the kernel finishes probing the
@@ -179,9 +180,10 @@ void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
                 failCount++;
                 slot.completion = nullptr;
                 OSSafeReleaseNULL(slot.buffer);
-                if (slot.dma) {
-                    slot.dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
-                    OSSafeReleaseNULL(slot.dma);
+                if (slot.staged) {
+                    IOFree(slot.staged, slot.stagedLength);
+                    slot.staged = nullptr;
+                    slot.stagedLength = 0;
                 }
                 slot.bufferAddress = 0;
                 slot.bufferLength = 0;
@@ -276,31 +278,10 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
     }
     memcpy(bytes, &descriptor, sizeof(descriptor));
 
-    if (payloadLength > 0) {
-        // Second fetch at dequeue time: by now the kernel has dispatched the
-        // task and may have staged the outbound data (the buffer obtained at
-        // UserProcessParallelTask time observes only zeros).
-        bool copied = false;
-        IOBufferMemoryDescriptor * fresh = nullptr;
-        if (UserGetDataBuffer(task.fTargetID, task.fControllerTaskIdentifier,
-                              &fresh) == kIOReturnSuccess && fresh) {
-            IOAddressSegment freshRange = {};
-            fresh->GetAddressRange(&freshRange);
-            if (freshRange.address != 0) {
-                uint64_t copyLength = payloadLength < freshRange.length
-                    ? payloadLength : freshRange.length;
-                memcpy(bytes + sizeof(descriptor),
-                       reinterpret_cast<const void *>(freshRange.address),
-                       copyLength);
-                copied = true;
-            }
-            fresh->release();
-        }
-        if (!copied && found->bufferAddress != 0) {
-            memcpy(bytes + sizeof(descriptor),
-                   reinterpret_cast<const void *>(found->bufferAddress),
-                   payloadLength);
-        }
+    if (payloadLength > 0 && found->staged != nullptr) {
+        uint64_t copyLength = payloadLength < found->stagedLength
+            ? payloadLength : found->stagedLength;
+        memcpy(bytes + sizeof(descriptor), found->staged, copyLength);
     }
 
     // Large outputs arrive as an IOMemoryDescriptor to fill; small ones as
@@ -349,12 +330,18 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     SCSIUserParallelTask task = found->task;
     OSAction * completion = found->completion;
     IOBufferMemoryDescriptor * buffer = found->buffer;
-    IODMACommand * dma = found->dma;
     uint64_t bufferAddress = found->bufferAddress;
     uint64_t bufferLength = found->bufferLength;
+    if (found->staged) {
+        IOFree(found->staged, found->stagedLength);
+        found->staged = nullptr;
+        found->stagedLength = 0;
+    }
+    if (reply.taskID >= 1 && reply.taskID <= 64) {
+        ivars->activeTaskIDs &= ~(1ULL << (reply.taskID - 1));
+    }
     found->completion = nullptr;
     found->buffer = nullptr;
-    found->dma = nullptr;
     found->bufferAddress = 0;
     found->bufferLength = 0;
     found->state = SlotState::free_;
@@ -370,12 +357,6 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
         memcpy(reinterpret_cast<void *>(bufferAddress),
                reinterpret_cast<const uint8_t *>(bytes) + sizeof(ISCSIKitTaskResponse),
                copyLength);
-    }
-    if (dma) {
-        uint64_t completeFlags = 0;
-        dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
-        (void)completeFlags;
-        dma->release();
     }
     OSSafeReleaseNULL(buffer);
 
@@ -505,8 +486,8 @@ kern_return_t IMPL(iSCSIKitDext, UserInitializeController)
         }
     };
 
-    setNumber(kIOMaximumSegmentCountReadKey, 256);
-    setNumber(kIOMaximumSegmentCountWriteKey, 256);
+    setNumber(kIOMaximumSegmentCountReadKey, 1);
+    setNumber(kIOMaximumSegmentCountWriteKey, 1);
     setNumber(kIOMaximumSegmentByteCountReadKey, kMaxTransferSize);
     setNumber(kIOMaximumSegmentByteCountWriteKey, kMaxTransferSize);
     setNumber(kIOMinimumSegmentAlignmentByteCountKey, 4);
@@ -572,37 +553,33 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     slot->bufferAddress = range.address;
     slot->bufferLength = range.length;
     slot->bufferIOVA = parallelRequest.fBufferIOVMAddr;
-    // "The caller will have to prepare new DMA mappings for this buffer":
-    // PrepareForDMA is the required step that makes the kernel stage the
-    // caller's outbound data into the bounce buffer.
-    slot->dma = nullptr;
-    slot->firstNonzeroOffset = 0xFFFF;
-    if (buffer) {
-        IODMACommandSpecification spec = {};
-        spec.options = kIODMACommandSpecificationNoOptions;
-        spec.maxAddressBits = 64;
-        IODMACommand * dma = nullptr;
-        kern_return_t dmaRet = IODMACommand::Create(this, 0, &spec, &dma);
-        if (dmaRet == kIOReturnSuccess && dma) {
-            uint64_t dmaFlags = 0;
-            uint32_t segmentsCount = 8;
-            IOAddressSegment segments[8] = {};
-            dmaRet = dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions,
-                                        buffer, 0, 0,
-                                        &dmaFlags, &segmentsCount, segments);
-            if (dmaRet == kIOReturnSuccess) {
-                slot->dma = dma;
-            } else {
-                dma->release();
-            }
+    // Duplicate-task-ID detection: Apple DTS diagnoses zeroed write buffers
+    // as wrong-task lookups caused by reused controller task IDs.
+    uint64_t taskBit = (parallelRequest.fControllerTaskIdentifier >= 1 &&
+                        parallelRequest.fControllerTaskIdentifier <= 64)
+        ? (1ULL << (parallelRequest.fControllerTaskIdentifier - 1)) : 0;
+    bool duplicateID = taskBit != 0 && (ivars->activeTaskIDs & taskBit) != 0;
+    ivars->activeTaskIDs |= taskBit;
+
+    // Capture the write payload HERE, inside the documented context for
+    // UserGetDataBuffer, and never touch the buffer again afterwards.
+    slot->staged = nullptr;
+    slot->stagedLength = 0;
+    slot->firstNonzeroOffset = duplicateID ? 0xDEAD : 0x0;
+    if (parallelRequest.fTransferDirection == kISCSIKitWrite &&
+        range.address != 0 && parallelRequest.fRequestedTransferCount > 0) {
+        uint64_t stageLength = parallelRequest.fRequestedTransferCount;
+        if (stageLength > range.length) {
+            stageLength = range.length;
         }
-        slot->firstNonzeroOffset = static_cast<uint16_t>(dmaRet & 0xFFFF);
-        if (parallelRequest.fTransferDirection == kISCSIKitWrite && range.address != 0) {
-            const uint8_t * probe = reinterpret_cast<const uint8_t *>(range.address);
-            uint64_t scanLimit = range.length < 65000 ? range.length : 65000;
-            for (uint64_t i = 0; i < scanLimit; i++) {
-                if (probe[i] != 0) {
-                    slot->firstNonzeroOffset = static_cast<uint16_t>(0x1000 + i);
+        uint8_t * staged = reinterpret_cast<uint8_t *>(IOMallocZero(stageLength));
+        if (staged) {
+            memcpy(staged, reinterpret_cast<const void *>(range.address), stageLength);
+            slot->staged = staged;
+            slot->stagedLength = stageLength;
+            for (uint64_t i = 0; i < stageLength; i++) {
+                if (staged[i] != 0) {
+                    slot->firstNonzeroOffset = 0x1;
                     break;
                 }
             }

@@ -79,6 +79,23 @@ the outbound payload is never observable by the dext:
 | 4 | `fBufferIOVMAddr` is dereferenceable in a virtual dext | `memcpy` from it | SIGSEGV, KERN_INVALID_ADDRESS; address is not in any VM region of the dext (it is a DMA/IOVA address) |
 | 5 | "The caller will have to prepare new DMA mappings for this buffer" (header doc) triggers copy-in | `IODMACommand::Create(this, …)` + `PrepareForDMA(0, bounceBuffer, 0, 0, …)` in `UserProcessParallelTask` | PrepareForDMA returns kIOReturnSuccess; bounce still all zeros |
 | 6 | Address-limited HBA forces kernel bounce+fill | `UserGetDMASpecification` numAddressBits = 32 and `kIOMaximumSegmentAddressableBitCountKey` = 32 | No fill; probe stalls after TEST UNIT READY (only TUR ever dispatched). Consistent with DART/IOMMU satisfying the constraint by remapping instead of bouncing |
+| 7 | Duplicate controller task IDs cause wrong-task lookup (Apple DTS diagnosis, forums thread 837320) | Runtime bitmap of active task IDs; duplicates flagged | No duplicate ever detected; IDs unique while active |
+| 8 | Inconsistent HBA constraints confuse staging | maxTransferSize 16384 with exactly 1 segment x 16384 bytes (fully coherent set) | Kernel dispatches 16 KB writes accordingly; payload still all zeros |
+| 9 | Payload must be read inside the documented context | Copy performed inside `UserProcessParallelTask` itself, immediately after `UserGetDataBuffer` + `GetAddressRange`; buffer never touched later | Still all zeros at capture time |
+
+## 5b. Final determination (2026-08-30)
+
+With unique task IDs, coherent constraints, correct transfer direction and
+the copy performed inside the documented callback context, the buffer
+returned by `UserGetDataBuffer` contains zeros for every write. Combined
+with binary inspection showing the kernel-side implementation zeroes a new
+buffer and copies from the original task descriptor for write tasks, the
+evidence points at the kernel's source-descriptor copy producing no data
+for a software-only controller on Apple Silicon macOS 26 (26.6.2/25G83).
+Public reports indicate software-backed SCSI writes work on Intel macOS 26
+and on Apple Silicon macOS 27, making an OS-version-specific defect the
+leading explanation. Next step: Feedback Assistant + DTS incident (draft in
+docs/DTS-REPORT.md).
 
 Timing notes: the bounce was probed (a) inside `UserProcessParallelTask`,
 (b) at dequeue time in the user client external method (different queue),
