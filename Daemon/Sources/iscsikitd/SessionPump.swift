@@ -77,6 +77,9 @@ final class SessionPump: @unchecked Sendable {
         guard let dext else { return }
         do {
             let (descriptor, dataOut) = try dext.dequeueTask(taskID)
+            let nonzero = dataOut.reduce(0) { $1 != 0 ? $0 + 1 : $0 }
+            let stageOffset = withUnsafeBytes(of: descriptor.reserved) { $0.load(as: UInt16.self) }
+            print("task \(taskID): cdb 0x\(String(format: "%02x", descriptor.cdb.0)) dir \(descriptor.direction) len \(descriptor.transferLength) payload \(dataOut.count)B nz \(nonzero) stage 0x\(String(stageOffset, radix: 16))")
             guard let session = sessions[descriptor.targetID] else {
                 try completeFailed(taskID: taskID, targetID: descriptor.targetID)
                 return
@@ -99,7 +102,9 @@ final class SessionPump: @unchecked Sendable {
                 cdb: cdbData,
                 direction: direction,
                 transferLength: descriptor.transferLength,
-                dataOut: direction == .write ? dataOut : nil
+                dataOut: direction == .write
+                    ? dataOut.prefix(Int(descriptor.transferLength))
+                    : nil
             )
 
             var response = ISCSIKitTaskResponse()
@@ -115,6 +120,7 @@ final class SessionPump: @unchecked Sendable {
                 response.senseLength = UInt8(count)
             }
             try dext.completeTask(response, dataIn: result.dataIn)
+            print("task \(taskID): status 0x\(String(format: "%02x", result.status)) in \(result.dataIn.count)B")
         } catch {
             FileHandle.standardError.write(Data("task \(taskID) failed: \(error)\n".utf8))
             try? completeFailed(taskID: taskID, targetID: 0)

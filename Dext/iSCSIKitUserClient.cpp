@@ -4,6 +4,7 @@
 #include <string.h>
 #include <DriverKit/IOLib.h>
 #include <DriverKit/IODispatchQueue.h>
+#include <DriverKit/IOMemoryMap.h>
 #include <DriverKit/OSData.h>
 #include "iSCSIKitDext.h"
 #include "iSCSIKitUserClient.h"
@@ -36,18 +37,11 @@ void iSCSIKitUserClient::free()
 
 kern_return_t IMPL(iSCSIKitUserClient, Start)
 {
-    kern_return_t ret = Start(provider, SUPERDISPATCH);
-    if (ret != kIOReturnSuccess) {
-        return ret;
-    }
-
     // ExternalMethod carries QUEUENAME(IOUserClientQueueExternalMethod): give
-    // it a dedicated serial queue. Without it, external methods dispatch on
-    // the controller's Default queue and any synchronous framework call that
-    // needs kernel->dext callbacks (UserCreateTargetForID, probe I/O)
-    // deadlocks the whole stack.
+    // it a dedicated serial queue, and install it BEFORE the super Start
+    // wires this object to the kernel; later registration is ignored.
     IODispatchQueue * methodQueue = nullptr;
-    ret = IODispatchQueue::Create("IOUserClientQueueExternalMethod", 0, 0, &methodQueue);
+    kern_return_t ret = IODispatchQueue::Create("IOUserClientQueueExternalMethod", 0, 0, &methodQueue);
     if (ret != kIOReturnSuccess || !methodQueue) {
         LOG("failed to create external-method queue: 0x%x", ret);
         return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
@@ -56,6 +50,11 @@ kern_return_t IMPL(iSCSIKitUserClient, Start)
     methodQueue->release();
     if (ret != kIOReturnSuccess) {
         LOG("failed to set external-method queue: 0x%x", ret);
+        return ret;
+    }
+
+    ret = Start(provider, SUPERDISPATCH);
+    if (ret != kIOReturnSuccess) {
         return ret;
     }
     ivars->controller = OSDynamicCast(iSCSIKitDext, provider);
@@ -132,6 +131,19 @@ kern_return_t iSCSIKitUserClient::ExternalMethod(uint64_t selector,
         return ivars->controller->DaemonDequeueTask(arguments->scalarInput[0], arguments);
 
     case kISCSIKitMethodCompleteTask: {
+        // Large inputs arrive as an IOMemoryDescriptor, small ones as OSData.
+        if (arguments->structureInputDescriptor) {
+            IOMemoryMap * map = nullptr;
+            kern_return_t ret = arguments->structureInputDescriptor->CreateMapping(
+                kIOMemoryMapReadOnly, 0, 0, 0, 0, &map);
+            if (ret != kIOReturnSuccess || !map) {
+                return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+            }
+            ret = ivars->controller->DaemonCompleteTask(
+                reinterpret_cast<const void *>(map->GetAddress()), map->GetLength());
+            map->release();
+            return ret;
+        }
         if (!arguments->structureInput) {
             return kIOReturnBadArgument;
         }

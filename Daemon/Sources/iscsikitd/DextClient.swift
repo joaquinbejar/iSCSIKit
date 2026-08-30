@@ -50,10 +50,13 @@ final class DextClient {
         notifyPort = port
         IONotificationPortSetDispatchQueue(port, queue)
 
-        let callback: IOAsyncCallback = { refcon, result, args, numArgs in
-            guard result == KERN_SUCCESS, numArgs >= 1, let args, let refcon else { return }
+        // IODispatchCalloutFromMessage invokes the callout with the async
+        // arguments unpacked: (refcon, result, arg0, arg1, …), not as an
+        // array. One argument here: arg0 is the controller task id.
+        let callback: IOAsyncCallback1 = { refcon, result, arg0 in
+            guard result == KERN_SUCCESS, let refcon else { return }
             let client = Unmanaged<DextClient>.fromOpaque(refcon).takeUnretainedValue()
-            let taskID = UInt64(UInt(bitPattern: args.pointee))
+            let taskID = UInt64(UInt(bitPattern: arg0))
             client.onTaskPending?(taskID)
         }
 
