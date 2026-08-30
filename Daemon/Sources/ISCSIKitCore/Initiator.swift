@@ -211,7 +211,7 @@ public final class Initiator {
     /// Executes an arbitrary CDB against the logged-in session. This is the
     /// data path for the dext: macOS builds the CDBs, we just transport them.
     public func execute(lun: Int32, cdb: Data, direction: TransferDirection,
-                        transferLength: UInt32, dataOut: Data? = nil) throws -> RawResult {
+                        transferLength: UInt32, dataOut: Data.SubSequence? = nil) throws -> RawResult {
         var cdbBytes = [UInt8](cdb)
         guard let task = scsi_create_task(Int32(cdbBytes.count), &cdbBytes,
                                           direction.xferDir, Int32(transferLength)) else {

@@ -5,11 +5,14 @@
 #include <os/log.h>
 #include <string.h>
 #include <DriverKit/IOLib.h>
+#include <DriverKit/IODispatchQueue.h>
+#include <DriverKit/IODMACommand.h>
 #include <DriverKit/IOKitKeys.h>
 #include <DriverKit/OSDictionary.h>
 #include <DriverKit/OSNumber.h>
 #include <DriverKit/OSData.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
+#include <DriverKit/IOMemoryMap.h>
 #include <DriverKit/IOUserClient.h>
 #include <SCSIControllerDriverKit/IOSCSIParallelControllerCharacteristics.h>
 #include "iSCSIKitDext.h"
@@ -19,7 +22,12 @@
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "iSCSIKitDext: " fmt, ##__VA_ARGS__)
 
 static constexpr uint32_t kMaxTaskCount = 64;
-static constexpr uint64_t kMaxTransferSize = ISCSIKIT_MAX_TRANSFER;
+// Clamped to one 4KB chunk per task: UserGetDataBuffer only works for
+// transfers the kernel bounce-buffers (sub-page); larger I/O arrives as
+// direct user-page mappings it cannot hand us. The kernel splits all I/O
+// to this size. Slow but correct; the bundled shared-buffer path is the
+// planned fast replacement.
+static constexpr uint64_t kMaxTransferSize = 4096;
 
 namespace {
 
@@ -38,6 +46,13 @@ struct TaskSlot {
     IOBufferMemoryDescriptor * buffer;
     uint64_t bufferAddress;
     uint64_t bufferLength;
+    // For writes: the task's fBufferIOVMAddr. On a virtual controller the
+    // "IOVM" space is the dext's own address space, so outbound data is
+    // readable here directly; the bounce buffer from UserGetDataBuffer is
+    // never pre-filled for writes.
+    uint64_t bufferIOVA;
+    uint16_t firstNonzeroOffset;
+    IODMACommand * dma;
 };
 
 }  // namespace
@@ -46,6 +61,10 @@ struct iSCSIKitDext_IVars {
     IOLock * lock;
     iSCSIKitUserClient * userClient;  // not retained; cleared on client Stop
     TaskSlot slots[kMaxTaskCount];
+    // Target create/destroy run here, never on an RPC dispatch queue:
+    // UserCreateTargetForID blocks until the kernel finishes probing the
+    // target, and the probe's own callbacks need the RPC queues free.
+    IODispatchQueue * targetOpsQueue;
 };
 
 bool iSCSIKitDext::init()
@@ -68,6 +87,7 @@ bool iSCSIKitDext::init()
 void iSCSIKitDext::free()
 {
     if (ivars) {
+        OSSafeReleaseNULL(ivars->targetOpsQueue);
         if (ivars->lock) {
             IOLockFree(ivars->lock);
         }
@@ -78,7 +98,31 @@ void iSCSIKitDext::free()
 
 kern_return_t IMPL(iSCSIKitDext, Start)
 {
-    kern_return_t ret = Start(provider, SUPERDISPATCH);
+    // Queues must exist before the kernel connection is wired up in the
+    // super Start. The framework dispatches UserCreateTargetForID (and
+    // friends marked QUEUENAME(AuxiliaryQueue)) onto a controller queue
+    // named "AuxiliaryQueue" that the dext is expected to create; without
+    // it they fall back to the Default queue and starve the probe I/O
+    // callbacks that need it.
+    IODispatchQueue * auxiliary = nullptr;
+    kern_return_t ret = IODispatchQueue::Create("AuxiliaryQueue", 0, 0, &auxiliary);
+    if (ret != kIOReturnSuccess || !auxiliary) {
+        LOG("auxiliary queue creation failed: 0x%x", ret);
+        return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+    }
+    ret = SetDispatchQueue("AuxiliaryQueue", auxiliary);
+    auxiliary->release();
+    if (ret != kIOReturnSuccess) {
+        LOG("auxiliary queue set failed: 0x%x", ret);
+        return ret;
+    }
+    ret = IODispatchQueue::Create("iSCSIKitTargetOps", 0, 0, &ivars->targetOpsQueue);
+    if (ret != kIOReturnSuccess) {
+        LOG("target-ops queue creation failed: 0x%x", ret);
+        return ret;
+    }
+
+    ret = Start(provider, SUPERDISPATCH);
     if (ret != kIOReturnSuccess) {
         return ret;
     }
@@ -135,8 +179,13 @@ void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
                 failCount++;
                 slot.completion = nullptr;
                 OSSafeReleaseNULL(slot.buffer);
+                if (slot.dma) {
+                    slot.dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+                    OSSafeReleaseNULL(slot.dma);
+                }
                 slot.bufferAddress = 0;
                 slot.bufferLength = 0;
+                slot.bufferIOVA = 0;
                 slot.state = SlotState::free_;
             }
         }
@@ -151,20 +200,37 @@ void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
 
 kern_return_t iSCSIKitDext::DaemonRegisterTarget(uint64_t targetID)
 {
-    OSDictionary * props = OSDictionary::withCapacity(1);
-    if (!props) {
-        return kIOReturnNoMemory;
+    if (!ivars->targetOpsQueue) {
+        return kIOReturnNotReady;
     }
-    kern_return_t ret = UserCreateTargetForID(targetID, props);
-    props->release();
-    LOG("register target %llu: 0x%x", targetID, ret);
-    return ret;
+    // Fire and forget: blocking here would park the RPC dispatch queue that
+    // the kernel needs for the probe I/O this call triggers. The daemon
+    // observes success when the disk appears.
+    retain();
+    ivars->targetOpsQueue->DispatchAsync(^{
+        OSDictionary * props = OSDictionary::withCapacity(1);
+        if (props) {
+            kern_return_t ret = UserCreateTargetForID(targetID, props);
+            props->release();
+            LOG("register target %llu: 0x%x", targetID, ret);
+        }
+        release();
+    });
+    return kIOReturnSuccess;
 }
 
 kern_return_t iSCSIKitDext::DaemonUnregisterTarget(uint64_t targetID)
 {
-    LOG("unregister target %llu", targetID);
-    return UserDestroyTargetForID(targetID);
+    if (!ivars->targetOpsQueue) {
+        return kIOReturnNotReady;
+    }
+    retain();
+    ivars->targetOpsQueue->DispatchAsync(^{
+        LOG("unregister target %llu", targetID);
+        UserDestroyTargetForID(targetID);
+        release();
+    });
+    return kIOReturnSuccess;
 }
 
 kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
@@ -196,6 +262,7 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
     descriptor.direction = task.fTransferDirection;
     descriptor.cdbLength = task.fCommandSize;
     memcpy(descriptor.cdb, task.fCommandDescriptorBlock, sizeof(descriptor.cdb));
+    memcpy(descriptor.reserved, &found->firstNonzeroOffset, sizeof(uint16_t));
 
     uint64_t payloadLength = 0;
     if (task.fTransferDirection == kISCSIKitWrite) {
@@ -209,14 +276,50 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
     }
     memcpy(bytes, &descriptor, sizeof(descriptor));
 
-    if (payloadLength > 0 && found->bufferAddress != 0) {
-        uint64_t copyLength = payloadLength < found->bufferLength
-            ? payloadLength : found->bufferLength;
-        memcpy(bytes + sizeof(descriptor),
-               reinterpret_cast<const void *>(found->bufferAddress),
-               copyLength);
+    if (payloadLength > 0) {
+        // Second fetch at dequeue time: by now the kernel has dispatched the
+        // task and may have staged the outbound data (the buffer obtained at
+        // UserProcessParallelTask time observes only zeros).
+        bool copied = false;
+        IOBufferMemoryDescriptor * fresh = nullptr;
+        if (UserGetDataBuffer(task.fTargetID, task.fControllerTaskIdentifier,
+                              &fresh) == kIOReturnSuccess && fresh) {
+            IOAddressSegment freshRange = {};
+            fresh->GetAddressRange(&freshRange);
+            if (freshRange.address != 0) {
+                uint64_t copyLength = payloadLength < freshRange.length
+                    ? payloadLength : freshRange.length;
+                memcpy(bytes + sizeof(descriptor),
+                       reinterpret_cast<const void *>(freshRange.address),
+                       copyLength);
+                copied = true;
+            }
+            fresh->release();
+        }
+        if (!copied && found->bufferAddress != 0) {
+            memcpy(bytes + sizeof(descriptor),
+                   reinterpret_cast<const void *>(found->bufferAddress),
+                   payloadLength);
+        }
     }
 
+    // Large outputs arrive as an IOMemoryDescriptor to fill; small ones as
+    // an OSData we create. Handle both or DequeueTask fails for big buffers.
+    if (arguments->structureOutputDescriptor) {
+        IOMemoryMap * map = nullptr;
+        kern_return_t ret = arguments->structureOutputDescriptor->CreateMapping(
+            0, 0, 0, 0, 0, &map);
+        if (ret != kIOReturnSuccess || !map) {
+            IOFree(bytes, totalLength);
+            return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+        }
+        uint64_t mapLength = map->GetLength();
+        uint64_t copyLength = totalLength < mapLength ? totalLength : mapLength;
+        memcpy(reinterpret_cast<void *>(map->GetAddress()), bytes, copyLength);
+        map->release();
+        IOFree(bytes, totalLength);
+        return kIOReturnSuccess;
+    }
     arguments->structureOutput = OSData::withBytes(bytes, totalLength);
     IOFree(bytes, totalLength);
     return arguments->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
@@ -246,10 +349,12 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     SCSIUserParallelTask task = found->task;
     OSAction * completion = found->completion;
     IOBufferMemoryDescriptor * buffer = found->buffer;
+    IODMACommand * dma = found->dma;
     uint64_t bufferAddress = found->bufferAddress;
     uint64_t bufferLength = found->bufferLength;
     found->completion = nullptr;
     found->buffer = nullptr;
+    found->dma = nullptr;
     found->bufferAddress = 0;
     found->bufferLength = 0;
     found->state = SlotState::free_;
@@ -265,6 +370,12 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
         memcpy(reinterpret_cast<void *>(bufferAddress),
                reinterpret_cast<const uint8_t *>(bytes) + sizeof(ISCSIKitTaskResponse),
                copyLength);
+    }
+    if (dma) {
+        uint64_t completeFlags = 0;
+        dma->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+        (void)completeFlags;
+        dma->release();
     }
     OSSafeReleaseNULL(buffer);
 
@@ -460,6 +571,43 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     slot->buffer = buffer;
     slot->bufferAddress = range.address;
     slot->bufferLength = range.length;
+    slot->bufferIOVA = parallelRequest.fBufferIOVMAddr;
+    // "The caller will have to prepare new DMA mappings for this buffer":
+    // PrepareForDMA is the required step that makes the kernel stage the
+    // caller's outbound data into the bounce buffer.
+    slot->dma = nullptr;
+    slot->firstNonzeroOffset = 0xFFFF;
+    if (buffer) {
+        IODMACommandSpecification spec = {};
+        spec.options = kIODMACommandSpecificationNoOptions;
+        spec.maxAddressBits = 64;
+        IODMACommand * dma = nullptr;
+        kern_return_t dmaRet = IODMACommand::Create(this, 0, &spec, &dma);
+        if (dmaRet == kIOReturnSuccess && dma) {
+            uint64_t dmaFlags = 0;
+            uint32_t segmentsCount = 8;
+            IOAddressSegment segments[8] = {};
+            dmaRet = dma->PrepareForDMA(kIODMACommandPrepareForDMANoOptions,
+                                        buffer, 0, 0,
+                                        &dmaFlags, &segmentsCount, segments);
+            if (dmaRet == kIOReturnSuccess) {
+                slot->dma = dma;
+            } else {
+                dma->release();
+            }
+        }
+        slot->firstNonzeroOffset = static_cast<uint16_t>(dmaRet & 0xFFFF);
+        if (parallelRequest.fTransferDirection == kISCSIKitWrite && range.address != 0) {
+            const uint8_t * probe = reinterpret_cast<const uint8_t *>(range.address);
+            uint64_t scanLimit = range.length < 65000 ? range.length : 65000;
+            for (uint64_t i = 0; i < scanLimit; i++) {
+                if (probe[i] != 0) {
+                    slot->firstNonzeroOffset = static_cast<uint16_t>(0x1000 + i);
+                    break;
+                }
+            }
+        }
+    }
     iSCSIKitUserClient * client = ivars->userClient;
     IOLockUnlock(ivars->lock);
 
