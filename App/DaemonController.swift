@@ -25,7 +25,7 @@ final class DaemonController: ObservableObject {
 
     init() {
         let bundled = Bundle.main.bundleURL
-            .appendingPathComponent("Contents/MacOS/iscsikitd").path
+            .appendingPathComponent("Contents/Library/iSCSIKitDaemon.app/Contents/MacOS/iSCSIKitDaemon").path
         let fallback = FileManager.default.isExecutableFile(atPath: bundled)
             ? bundled
             : "/opt/homebrew/bin/iscsikitd"

@@ -5,10 +5,10 @@
 	<key>Label</key>
 	<string>com.taunais.iscsikit.daemon</string>
 	<key>BundleProgram</key>
-	<string>Contents/MacOS/iscsikitd</string>
+	<string>Contents/Library/iSCSIKitDaemon.app/Contents/MacOS/iSCSIKitDaemon</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>Contents/MacOS/iscsikitd</string>
+		<string>Contents/Library/iSCSIKitDaemon.app/Contents/MacOS/iSCSIKitDaemon</string>
 		<string>serve</string>
 		<string>--config</string>
 	</array>

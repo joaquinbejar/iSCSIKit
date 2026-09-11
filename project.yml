@@ -91,28 +91,41 @@ targets:
           export PKG_CONFIG_PATH=/opt/homebrew/lib/pkgconfig
           cd "$SRCROOT/Daemon"
           swift build -c release
-          mkdir -p "$CODESIGNING_FOLDER_PATH/Contents/MacOS" "$CODESIGNING_FOLDER_PATH/Contents/Frameworks"
-          cp -f .build/release/iscsikitd "$CODESIGNING_FOLDER_PATH/Contents/MacOS/"
+          # Package the daemon as a nested .app bundle so it can carry its own
+          # embedded provisioning profile — a restricted DriverKit entitlement
+          # (userclient-access) on a bare CLI tool is SIGKILLed by AMFI at
+          # launch; only a bundle with embedded.provisionprofile is honored.
+          DAPP="$CODESIGNING_FOLDER_PATH/Contents/Library/iSCSIKitDaemon.app"
+          rm -rf "$DAPP"
+          mkdir -p "$DAPP/Contents/MacOS" "$DAPP/Contents/Frameworks"
+          cp -f .build/release/iscsikitd "$DAPP/Contents/MacOS/iSCSIKitDaemon"
+          cp -f "$SRCROOT/Daemon/DaemonBundle-Info.plist" "$DAPP/Contents/Info.plist"
           # Bundle libiscsi: hardened-runtime binaries cannot load Homebrew's
           # ad-hoc-signed dylib (different team ID).
           LIBISCSI=$(readlink -f /opt/homebrew/opt/libiscsi/lib/libiscsi.11.dylib)
-          cp -f "$LIBISCSI" "$CODESIGNING_FOLDER_PATH/Contents/Frameworks/libiscsi.11.dylib"
+          cp -f "$LIBISCSI" "$DAPP/Contents/Frameworks/libiscsi.11.dylib"
           install_name_tool -change /opt/homebrew/opt/libiscsi/lib/libiscsi.11.dylib \
             @executable_path/../Frameworks/libiscsi.11.dylib \
-            "$CODESIGNING_FOLDER_PATH/Contents/MacOS/iscsikitd" 2>/dev/null || true
+            "$DAPP/Contents/MacOS/iSCSIKitDaemon" 2>/dev/null || true
+          PROFILE="$SRCROOT/Daemon/signing/DaemonDeveloperID.provisionprofile"
+          if [ "$CONFIGURATION" = "Release" ] && [ -f "$PROFILE" ]; then
+            cp -f "$PROFILE" "$DAPP/Contents/embedded.provisionprofile"
+          fi
           if [ "$CODE_SIGNING_ALLOWED" = "YES" ] && [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ]; then
             codesign --force --options runtime --timestamp \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
-              "$CODESIGNING_FOLDER_PATH/Contents/Frameworks/libiscsi.11.dylib"
+              "$DAPP/Contents/Frameworks/libiscsi.11.dylib"
             DAEMON_ENTS=""
             if [ "$CONFIGURATION" = "Release" ]; then
               DAEMON_ENTS="--entitlements $SRCROOT/Daemon/Daemon-DeveloperID.entitlements"
             fi
+            # Sign the nested bundle; --entitlements applies to its main
+            # executable, and the embedded profile authorizes them.
             codesign --force --options runtime --timestamp \
               --identifier com.taunais.iscsi-initiator.daemon \
               $DAEMON_ENTS \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
-              "$CODESIGNING_FOLDER_PATH/Contents/MacOS/iscsikitd"
+              "$DAPP"
           fi
 
 schemes:
