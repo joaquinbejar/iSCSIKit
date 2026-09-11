@@ -4,8 +4,7 @@
 <dict>
 	<key>com.apple.developer.driverkit.userclient-access</key>
 	<array>
-		<string>com.taunais.iscsi-initiator</string>
-		<string>com.taunais.iscsi-initiator.daemon</string>
+		<string>com.taunais.iscsi-initiator.dext</string>
 	</array>
 </dict>
 </plist>
