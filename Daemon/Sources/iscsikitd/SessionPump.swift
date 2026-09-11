@@ -96,10 +96,14 @@ final class SessionPump: @unchecked Sendable {
             // them here with WRITE PROTECTED sense instead of sending them,
             // and never let a write op touch the disk. Remove this guard only
             // when the OS write path is fixed and verified.
-            if ReadOnlyPolicy.modifiesMedium(opcode: descriptor.cdb.0) {
+            // Default-deny read-only guard: anything not on the allowlist is
+            // rejected before it can reach the transport, so no destructive
+            // command (SANITIZE, WRITE SAME, UNMAP, FORMAT, WRITE LONG, an
+            // unknown/vendor opcode, …) can ever touch the disk.
+            if !ReadOnlyPolicy.isAllowed(opcode: descriptor.cdb.0) {
                 try completeWriteProtected(taskID: descriptor.taskID,
                                            targetID: descriptor.targetID)
-                print("task \(taskID): cdb 0x\(String(format: "%02x", descriptor.cdb.0)) BLOCKED (read-only)")
+                print("task \(taskID): cdb 0x\(String(format: "%02x", descriptor.cdb.0)) REJECTED (read-only)")
                 return
             }
 
