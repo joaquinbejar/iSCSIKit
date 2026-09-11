@@ -89,6 +89,20 @@ final class SessionPump: @unchecked Sendable {
             let cdbData = withUnsafeBytes(of: &cdb) {
                 Data($0.prefix(Int(descriptor.cdbLength)))
             }
+
+            // Read-only guard: the write data path is broken on Apple Silicon
+            // macOS 26 (the kernel stages zeros), so any medium-modifying
+            // command that reached the target would corrupt the LUN. Reject
+            // them here with WRITE PROTECTED sense instead of sending them,
+            // and never let a write op touch the disk. Remove this guard only
+            // when the OS write path is fixed and verified.
+            if ReadOnlyPolicy.modifiesMedium(opcode: descriptor.cdb.0) {
+                try completeWriteProtected(taskID: descriptor.taskID,
+                                           targetID: descriptor.targetID)
+                print("task \(taskID): cdb 0x\(String(format: "%02x", descriptor.cdb.0)) BLOCKED (read-only)")
+                return
+            }
+
             let direction: Initiator.TransferDirection
             switch UInt32(descriptor.direction) {
             case kISCSIKitWrite.rawValue: direction = .write
@@ -155,6 +169,23 @@ final class SessionPump: @unchecked Sendable {
         response.taskID = taskID
         response.targetID = targetID
         response.status = 0x02  // CHECK CONDITION
+        try dext.completeTask(response, dataIn: Data())
+    }
+
+    /// Completes a task with DATA PROTECT / WRITE PROTECTED sense so the OS
+    /// treats the write as rejected by a read-only medium.
+    private func completeWriteProtected(taskID: UInt64, targetID: UInt64) throws {
+        guard let dext else { return }
+        var response = ISCSIKitTaskResponse()
+        response.taskID = taskID
+        response.targetID = targetID
+        response.status = 0x02  // CHECK CONDITION
+        let sense = ReadOnlyPolicy.writeProtectedSense()
+        withUnsafeMutableBytes(of: &response.sense) { buffer in
+            let count = min(sense.count, buffer.count)
+            sense.withUnsafeBytes { buffer.copyMemory(from: UnsafeRawBufferPointer(rebasing: $0.prefix(count))) }
+            response.senseLength = UInt8(count)
+        }
         try dext.completeTask(response, dataIn: Data())
     }
 

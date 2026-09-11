@@ -104,8 +104,13 @@ targets:
             codesign --force --options runtime --timestamp \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               "$CODESIGNING_FOLDER_PATH/Contents/Frameworks/libiscsi.11.dylib"
+            DAEMON_ENTS=""
+            if [ "$CONFIGURATION" = "Release" ]; then
+              DAEMON_ENTS="--entitlements $SRCROOT/Daemon/Daemon-DeveloperID.entitlements"
+            fi
             codesign --force --options runtime --timestamp \
               --identifier com.taunais.iscsi-initiator.daemon \
+              $DAEMON_ENTS \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               "$CODESIGNING_FOLDER_PATH/Contents/MacOS/iscsikitd"
           fi
