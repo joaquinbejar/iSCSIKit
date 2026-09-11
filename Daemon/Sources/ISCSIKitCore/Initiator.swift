@@ -229,18 +229,33 @@ public final class Initiator {
         }
         guard result != nil else { throw lastError() }
 
-        let status = UInt8(truncatingIfNeeded: task.pointee.status)
+        // libiscsi task status is a full Int32: SCSI status bytes (0x00 GOOD,
+        // 0x02 CHECK CONDITION, …) fit a byte, but the transport sentinels
+        // CANCELLED/ERROR/TIMEOUT are large values (>= 0x0f000000). Truncating
+        // to UInt8 turned CANCELLED into GOOD and TIMEOUT into CHECK CONDITION,
+        // hiding failures and defeating the reconnect path. Treat any
+        // non-SCSI-status result as a transport error and throw.
+        let rawStatus = task.pointee.status
+        if rawStatus < 0 || rawStatus > 0xFF {
+            throw ISCSIError.libiscsi("transport failure: iscsi status 0x\(String(rawStatus, radix: 16))")
+        }
+        let status = UInt8(rawStatus)
+
         var dataIn = Data()
         if direction == .read, task.pointee.datain.size > 0, let base = task.pointee.datain.data {
             dataIn = Data(bytes: base, count: Int(task.pointee.datain.size))
         }
 
-        // libiscsi parses sense data; rebuild fixed-format bytes for the host.
+        // libiscsi parses the sense; rebuild a valid fixed-format buffer.
+        // Force response code 0x70 (fixed, current) so the host decodes the
+        // key at byte 2 and ASC/ASCQ at bytes 12/13 — copying libiscsi's
+        // error_type verbatim could stamp a descriptor-format code (0x72),
+        // which shifts every field and mangles the sense key.
         var sense = Data()
         if status == UInt8(SCSI_STATUS_CHECK_CONDITION.rawValue) {
             var fixed = [UInt8](repeating: 0, count: 18)
-            fixed[0] = task.pointee.sense.error_type
-            fixed[2] = UInt8(truncatingIfNeeded: task.pointee.sense.key.rawValue)
+            fixed[0] = 0x70
+            fixed[2] = UInt8(truncatingIfNeeded: task.pointee.sense.key.rawValue) & 0x0F
             fixed[7] = 10
             fixed[12] = UInt8(truncatingIfNeeded: task.pointee.sense.ascq >> 8)
             fixed[13] = UInt8(truncatingIfNeeded: task.pointee.sense.ascq & 0xFF)

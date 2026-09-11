@@ -96,9 +96,12 @@ final class SessionPump: @unchecked Sendable {
             default: direction = .none
             }
 
+            // Address the LUN the session actually logged into, not
+            // descriptor.lun: the virtual HBA always presents LUN 0, so the
+            // kernel's task carries 0 while the remote LUN may be any value.
             let result = try executeWithReconnect(
                 session: session,
-                lun: Int32(descriptor.lun),
+                lun: session.url.lun,
                 cdb: cdbData,
                 direction: direction,
                 transferLength: descriptor.transferLength,

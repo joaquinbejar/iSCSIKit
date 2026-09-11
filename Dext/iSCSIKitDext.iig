@@ -17,7 +17,7 @@ public:
     virtual kern_return_t NewUserClient(uint32_t type, IOUserClient ** userClient) override;
 
     // Daemon-facing plumbing, called by iSCSIKitUserClient::ExternalMethod.
-    virtual void DaemonSetUserClient(iSCSIKitUserClient * client) LOCALONLY;
+    virtual bool DaemonSetUserClient(iSCSIKitUserClient * client) LOCALONLY;
     virtual kern_return_t DaemonRegisterTarget(uint64_t targetID) LOCALONLY;
     virtual kern_return_t DaemonUnregisterTarget(uint64_t targetID) LOCALONLY;
     virtual kern_return_t DaemonDequeueTask(uint64_t taskID,

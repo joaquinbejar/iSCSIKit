@@ -32,8 +32,9 @@ final class DaemonController: ObservableObject {
         daemonPath = UserDefaults.standard.string(forKey: "daemonPath") ?? fallback
     }
 
-    func start(urls: [String]) {
-        guard case .stopped = state, !urls.isEmpty else { return }
+    func start(configPath: URL) {
+        // A failed daemon must be restartable; only a live process blocks.
+        guard process == nil else { return }
         guard FileManager.default.isExecutableFile(atPath: daemonPath) else {
             state = .failed("daemon not found at \(daemonPath)")
             return
@@ -41,7 +42,10 @@ final class DaemonController: ObservableObject {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: daemonPath)
-        process.arguments = ["serve"] + urls
+        // Serve from the shared config file, not a bare URL list, so mutual
+        // CHAP credentials the UI stored reach the daemon (and the manual
+        // path matches the login agent exactly).
+        process.arguments = ["serve", "--config", configPath.path]
 
         let pipe = Pipe()
         process.standardOutput = pipe
@@ -78,7 +82,11 @@ final class DaemonController: ObservableObject {
     }
 
     func stop() {
-        process?.interrupt()  // SIGINT: daemon unregisters targets and exits
+        if let process {
+            process.interrupt()  // SIGINT: daemon unregisters targets and exits
+        } else {
+            state = .stopped  // clear a failed state with no live process
+        }
     }
 
     // MARK: - launchd agent (daemon survives app quit, starts at login)

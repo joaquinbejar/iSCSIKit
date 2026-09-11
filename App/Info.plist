@@ -24,5 +24,7 @@
 	<string>15.0</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>© 2026 Joaquin Bejar Garcia. MIT License.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>iSCSIKit connects to iSCSI targets on your local network to present their storage as disks.</string>
 </dict>
 </plist>

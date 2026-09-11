@@ -61,7 +61,12 @@ kern_return_t IMPL(iSCSIKitUserClient, Start)
     if (!ivars->controller) {
         return kIOReturnBadArgument;
     }
-    ivars->controller->DaemonSetUserClient(this);
+    if (!ivars->controller->DaemonSetUserClient(this)) {
+        // Another daemon already owns the controller; refuse this client.
+        LOG("rejected: controller already has a client");
+        ivars->controller = nullptr;
+        return kIOReturnExclusiveAccess;
+    }
     LOG("daemon connected");
     return kIOReturnSuccess;
 }

@@ -80,9 +80,9 @@ struct ContentView: View {
                         daemonStatusView
                         Spacer()
                         Button("Connect All") {
-                            daemon.start(urls: targetStore.targets.map(\.url))
+                            daemon.start(configPath: TargetStore.configPath)
                         }
-                        .disabled(daemon.state != .stopped || targetStore.targets.isEmpty)
+                        .disabled(isDaemonRunning || targetStore.targets.isEmpty)
                         Button("Disconnect") { daemon.stop() }
                             .disabled(daemon.state == .stopped)
                     }
@@ -152,6 +152,11 @@ struct ContentView: View {
             Label("No login agent", systemImage: "clock")
                 .foregroundStyle(.secondary)
         }
+    }
+
+    private var isDaemonRunning: Bool {
+        if case .running = daemon.state { return true }
+        return false
     }
 
     @ViewBuilder

@@ -156,7 +156,7 @@ kern_return_t IMPL(iSCSIKitDext, NewUserClient)
 
 #pragma mark - Daemon plumbing
 
-void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
+bool iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
 {
     // Collect outstanding work under the lock; complete outside it. Kernel
     // RPCs must never run while holding the slot lock.
@@ -165,6 +165,14 @@ void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
     uint32_t failCount = 0;
 
     IOLockLock(ivars->lock);
+    // Reject a second concurrent daemon: it must not silently take over the
+    // targets an already-connected client is serving (a mix of "Connect All"
+    // and the login agent, or two apps, would otherwise route a disk's I/O
+    // to the wrong session).
+    if (client && ivars->userClient && ivars->userClient != client) {
+        IOLockUnlock(ivars->lock);
+        return false;
+    }
     ivars->userClient = client;
     if (!client) {
         for (auto & slot : ivars->slots) {
@@ -198,6 +206,7 @@ void iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
         ParallelTaskCompletion(completions[i], responses[i]);
         OSSafeReleaseNULL(completions[i]);
     }
+    return true;
 }
 
 kern_return_t iSCSIKitDext::DaemonRegisterTarget(uint64_t targetID)
@@ -567,21 +576,38 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     slot->stagedLength = 0;
     slot->firstNonzeroOffset = duplicateID ? 0xDEAD : 0x0;
     if (parallelRequest.fTransferDirection == kISCSIKitWrite &&
-        range.address != 0 && parallelRequest.fRequestedTransferCount > 0) {
+        parallelRequest.fRequestedTransferCount > 0) {
         uint64_t stageLength = parallelRequest.fRequestedTransferCount;
-        if (stageLength > range.length) {
-            stageLength = range.length;
+        // A write whose payload cannot be fully captured must FAIL, never be
+        // silently sent as zeros to the target.
+        if (range.address == 0 || stageLength > range.length) {
+            slot->state = SlotState::free_;
+            slot->completion = nullptr;
+            OSSafeReleaseNULL(completion);
+            ivars->activeTaskIDs &= ~taskBit;
+            IOLockUnlock(ivars->lock);
+            OSSafeReleaseNULL(buffer);
+            *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+            return kIOReturnNoMemory;
         }
         uint8_t * staged = reinterpret_cast<uint8_t *>(IOMallocZero(stageLength));
-        if (staged) {
-            memcpy(staged, reinterpret_cast<const void *>(range.address), stageLength);
-            slot->staged = staged;
-            slot->stagedLength = stageLength;
-            for (uint64_t i = 0; i < stageLength; i++) {
-                if (staged[i] != 0) {
-                    slot->firstNonzeroOffset = 0x1;
-                    break;
-                }
+        if (!staged) {
+            slot->state = SlotState::free_;
+            slot->completion = nullptr;
+            OSSafeReleaseNULL(completion);
+            ivars->activeTaskIDs &= ~taskBit;
+            IOLockUnlock(ivars->lock);
+            OSSafeReleaseNULL(buffer);
+            *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+            return kIOReturnNoMemory;
+        }
+        memcpy(staged, reinterpret_cast<const void *>(range.address), stageLength);
+        slot->staged = staged;
+        slot->stagedLength = stageLength;
+        for (uint64_t i = 0; i < stageLength; i++) {
+            if (staged[i] != 0) {
+                slot->firstNonzeroOffset = 0x1;
+                break;
             }
         }
     }

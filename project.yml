@@ -68,6 +68,7 @@ targets:
         CFBundleVersion: 1
         LSMinimumSystemVersion: "15.0"
         NSHumanReadableCopyright: "© 2026 Joaquin Bejar Garcia. MIT License."
+        NSLocalNetworkUsageDescription: "iSCSIKit connects to iSCSI targets on your local network to present their storage as disks."
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.taunais.iscsi-initiator
