@@ -100,7 +100,7 @@ final class SessionPump: @unchecked Sendable {
             // rejected before it can reach the transport, so no destructive
             // command (SANITIZE, WRITE SAME, UNMAP, FORMAT, WRITE LONG, an
             // unknown/vendor opcode, …) can ever touch the disk.
-            if !ReadOnlyPolicy.isAllowed(opcode: descriptor.cdb.0) {
+            if !ReadOnlyPolicy.isAllowed(cdb: cdbData) {
                 try completeWriteProtected(taskID: descriptor.taskID,
                                            targetID: descriptor.targetID)
                 print("task \(taskID): cdb 0x\(String(format: "%02x", descriptor.cdb.0)) REJECTED (read-only)")
