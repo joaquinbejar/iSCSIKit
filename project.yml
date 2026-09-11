@@ -27,11 +27,20 @@ targets:
         PRODUCT_NAME: com.taunais.iscsi-initiator.dext
         INFOPLIST_FILE: Dext/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS: Dext/Dext.entitlements
         HEADER_SEARCH_PATHS: $(SRCROOT)/Daemon/Sources/CISCSIKitShared/include
         SDKROOT: driverkit
         DRIVERKIT_DEPLOYMENT_TARGET: "23.0"
         OTHER_LDFLAGS: ["-framework", "SCSIControllerDriverKit"]
+      configs:
+        Debug:
+          CODE_SIGN_ENTITLEMENTS: Dext/Dext.entitlements
+        Release:
+          CODE_SIGN_ENTITLEMENTS: Dext/Dext-DeveloperID.entitlements
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          PROVISIONING_PROFILE_SPECIFIER: iSCSIKit DExt Developer ID
+          OTHER_CODE_SIGN_FLAGS: --timestamp
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
 
   iSCSIKit:
     type: application
@@ -66,6 +75,13 @@ targets:
         CODE_SIGN_ENTITLEMENTS: App/App.entitlements
         ENABLE_HARDENED_RUNTIME: true
         ENABLE_USER_SCRIPT_SANDBOXING: false
+      configs:
+        Release:
+          CODE_SIGN_STYLE: Manual
+          CODE_SIGN_IDENTITY: Developer ID Application
+          PROVISIONING_PROFILE_SPECIFIER: iSCSIKit App Developer ID
+          OTHER_CODE_SIGN_FLAGS: --timestamp
+          CODE_SIGN_INJECT_BASE_ENTITLEMENTS: NO
     postBuildScripts:
       - name: Embed iscsikitd
         script: |
@@ -84,10 +100,10 @@ targets:
             @executable_path/../Frameworks/libiscsi.11.dylib \
             "$CODESIGNING_FOLDER_PATH/Contents/MacOS/iscsikitd" 2>/dev/null || true
           if [ "$CODE_SIGNING_ALLOWED" = "YES" ] && [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ]; then
-            codesign --force --options runtime \
+            codesign --force --options runtime --timestamp \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               "$CODESIGNING_FOLDER_PATH/Contents/Frameworks/libiscsi.11.dylib"
-            codesign --force --options runtime \
+            codesign --force --options runtime --timestamp \
               --identifier com.taunais.iscsi-initiator.daemon \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               "$CODESIGNING_FOLDER_PATH/Contents/MacOS/iscsikitd"
