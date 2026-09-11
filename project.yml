@@ -108,7 +108,23 @@ targets:
             @executable_path/../Frameworks/libiscsi.11.dylib \
             "$DAPP/Contents/MacOS/iSCSIKitDaemon" 2>/dev/null || true
           PROFILE="$SRCROOT/Daemon/signing/DaemonDeveloperID.provisionprofile"
-          if [ "$CONFIGURATION" = "Release" ] && [ -f "$PROFILE" ]; then
+          DEXT_ID="com.taunais.iscsi-initiator.dext"
+          if [ "$CONFIGURATION" = "Release" ]; then
+            # The kernel only lets the daemon open the dext if the daemon's
+            # userclient-access lists the dext bundle ID, and AMFI only honors
+            # that entitlement when the embedded profile authorizes the same
+            # value. A Release build missing either signs and notarizes fine
+            # but fails IOServiceOpen for every user, so refuse to produce it.
+            if [ ! -f "$PROFILE" ]; then
+              echo "error: $PROFILE is missing; download the 'iSCSIKit Daemon Developer ID' profile there" >&2
+              exit 1
+            fi
+            if ! security cms -D -i "$PROFILE" 2>/dev/null \
+                | plutil -extract Entitlements xml1 -o - - \
+                | grep -q "<string>$DEXT_ID</string>"; then
+              echo "error: $PROFILE does not authorize userclient-access for $DEXT_ID; regenerate it once Apple adds the dext bundle ID to the team's allowed values" >&2
+              exit 1
+            fi
             cp -f "$PROFILE" "$DAPP/Contents/embedded.provisionprofile"
           fi
           if [ "$CODE_SIGNING_ALLOWED" = "YES" ] && [ -n "$EXPANDED_CODE_SIGN_IDENTITY" ]; then
@@ -126,6 +142,11 @@ targets:
               $DAEMON_ENTS \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               "$DAPP"
+            if [ "$CONFIGURATION" = "Release" ] && ! codesign -d --entitlements - --xml "$DAPP" 2>/dev/null \
+                | grep -q "<string>$DEXT_ID</string>"; then
+              echo "error: signed daemon does not carry userclient-access for $DEXT_ID" >&2
+              exit 1
+            fi
           fi
 
 schemes:
