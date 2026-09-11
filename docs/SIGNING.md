@@ -65,6 +65,20 @@ regenerate the daemon profile and rebuild.
 
 ### Verifying a build
 
+`scripts/check-userclient-access.py` performs the exact check the kernel
+performs: it reads the `com.apple.developer.driverkit.userclient-access`
+key (and only that key) and requires the dext bundle ID as a literal element.
+The Release post-build script runs it on the daemon profile before embedding
+it and on the daemon bundle after signing, and aborts the build otherwise.
+
+```sh
+scripts/check-userclient-access.py profile Daemon/signing/DaemonDeveloperID.provisionprofile com.taunais.iscsi-initiator.dext
+scripts/check-userclient-access.py signed /Applications/iSCSIKit.app/Contents/Library/iSCSIKitDaemon.app com.taunais.iscsi-initiator.dext
+scripts/check-userclient-access.py entitlements Daemon/Daemon-DeveloperID.entitlements com.taunais.iscsi-initiator.dext
+```
+
+For a manual look:
+
 ```sh
 # entitlements actually signed into each binary
 codesign -d --entitlements - --xml /Applications/iSCSIKit.app | plutil -p -

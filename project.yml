@@ -109,6 +109,7 @@ targets:
             "$DAPP/Contents/MacOS/iSCSIKitDaemon" 2>/dev/null || true
           PROFILE="$SRCROOT/Daemon/signing/DaemonDeveloperID.provisionprofile"
           DEXT_ID="com.taunais.iscsi-initiator.dext"
+          CHECK="$SRCROOT/scripts/check-userclient-access.py"
           if [ "$CONFIGURATION" = "Release" ]; then
             # The kernel only lets the daemon open the dext if the daemon's
             # userclient-access lists the dext bundle ID, and AMFI only honors
@@ -119,9 +120,7 @@ targets:
               echo "error: $PROFILE is missing; download the 'iSCSIKit Daemon Developer ID' profile there" >&2
               exit 1
             fi
-            if ! security cms -D -i "$PROFILE" 2>/dev/null \
-                | plutil -extract Entitlements xml1 -o - - \
-                | grep -q "<string>$DEXT_ID</string>"; then
+            if ! /usr/bin/python3 "$CHECK" profile "$PROFILE" "$DEXT_ID"; then
               echo "error: $PROFILE does not authorize userclient-access for $DEXT_ID; regenerate it once Apple adds the dext bundle ID to the team's allowed values" >&2
               exit 1
             fi
@@ -142,8 +141,7 @@ targets:
               $DAEMON_ENTS \
               --sign "$EXPANDED_CODE_SIGN_IDENTITY" \
               "$DAPP"
-            if [ "$CONFIGURATION" = "Release" ] && ! codesign -d --entitlements - --xml "$DAPP" 2>/dev/null \
-                | grep -q "<string>$DEXT_ID</string>"; then
+            if [ "$CONFIGURATION" = "Release" ] && ! /usr/bin/python3 "$CHECK" signed "$DAPP" "$DEXT_ID"; then
               echo "error: signed daemon does not carry userclient-access for $DEXT_ID" >&2
               exit 1
             fi
