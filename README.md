@@ -89,6 +89,15 @@ missing link is loading the signed dext so the kernel starts sending CDBs.
 > about, and never connect a second initiator to a LUN that is already
 > mounted elsewhere — block devices without a cluster filesystem corrupt.
 
+## Install a prebuilt app
+
+Download the notarized DMG from the
+[latest release](https://github.com/joaquinbejar/iSCSIKit/releases), drag
+iSCSIKit to Applications, launch it, click "Install Driver" and approve it in
+System Settings, then add your target and Connect All. The preview is
+read-only by design (see Status). `docs/SIGNING.md` explains how to verify
+the signatures and entitlements of any build.
+
 ## Requirements
 
 - Apple Silicon Mac, macOS 15+
