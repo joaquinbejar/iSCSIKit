@@ -23,8 +23,8 @@ kernel today. 256 MiB per I/O size for the transport runs.
 
 Reads reach ~83–89 MiB/s at 1 MiB I/O, the expected gigabit ceiling at queue
 depth 1. Writes track reads up to 256 KiB; the 1 MiB write figure varies with
-the NAS commit cadence. Every write was read back and matched its pattern
-byte for byte.
+the NAS commit cadence. After each write batch the tool reads back every
+region it wrote and compares it to the pattern, aborting on any mismatch.
 
 ## Full stack (dext block device, `dd if=/dev/rdiskN`)
 
