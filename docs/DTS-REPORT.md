@@ -46,10 +46,23 @@ controller (for example an iSCSI initiator) on Apple Silicon macOS 26.
   837425), suggesting a version-specific regression on Apple Silicon
   macOS 26.
 
+- Verified 2026-09-15: the same WRITE(16) CDBs with the same payloads
+  succeed when issued through libiscsi directly (`iscsikitd bench --write`
+  writes 256 MiB per I/O size and reads every region back: all match), and
+  a 1 MiB region written that way reads back byte-for-byte identical
+  through the dext block device (SHA-256 compared). Reads through the dext
+  reach 47 MB/s with 8 commands in flight. Only the outbound direction
+  through the dext is affected.
+- The controller reports one segment of 16384 bytes because
+  `SCSIUserParallelTask` carries a single `fBufferIOVMAddr`; a
+  multi-segment declaration makes every request larger than one page fail
+  with EIO before reaching the dext, so the tested configuration is the
+  only one that works for reads.
+
 ## Reproduction
 
 Complete open-source reproducer: https://github.com/joaquinbejar/iSCSIKit
-(commit <fill in>). Steps in docs/WRITE-PATH-INVESTIGATION.md section 8;
+(tag v0.1.1-preview, commit e0e30c7 or later). Steps in docs/WRITE-PATH-INVESTIGATION.md section 8;
 the daemon logs one line per write with a nonzero-byte count of the
 payload observed by the dext, which stays 0 for every write.
 
