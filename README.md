@@ -98,6 +98,10 @@ System Settings, then add your target and Connect All. The preview is
 read-only by design (see Status). `docs/SIGNING.md` explains how to verify
 the signatures and entitlements of any build.
 
+## Performance
+
+Sequential throughput (gigabit, queue depth 1): the transport reaches ~83 MiB/s read / ~50 MiB/s write, while the current driver path is bounded to ~1.5 MiB/s by a 16 KiB max transfer and serial task issue. Full tables and analysis in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+
 ## Requirements
 
 - Apple Silicon Mac, macOS 15+
