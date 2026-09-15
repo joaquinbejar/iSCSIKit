@@ -147,10 +147,26 @@ do {
                     withUnsafeBytes(of: v) { pattern.replaceSubrange(j..<j + 4, with: $0) }
                 }
                 try run(label: "WRITE(16)", opcode: 0x8A, startLBA: start, ioSize: ioSize, pattern: pattern)
-                let back = try initiator.execute(
-                    lun: url.lun, cdb: cdb16(0x88, lba: start, blocks: UInt32(ioSize / Int(blockSize))),
-                    direction: .read, transferLength: UInt32(ioSize))
-                print("  read-back of first \(ioSize / 1024)K: \(back.dataIn == pattern ? "matches pattern" : "MISMATCH")")
+                // Verify EVERY region just written, not only the first, and
+                // abort the whole run on any mismatch or read failure — the
+                // point is to prove the write landed, so a silent difference
+                // must never pass.
+                let blocks = UInt32(ioSize / Int(blockSize))
+                let ops = (mib * 1_048_576) / ioSize
+                var lba = start
+                for _ in 0..<ops {
+                    let back = try initiator.execute(
+                        lun: url.lun, cdb: cdb16(0x88, lba: lba, blocks: blocks),
+                        direction: .read, transferLength: UInt32(ioSize))
+                    guard back.status == 0 else {
+                        fail("verify read failed at LBA \(lba): status 0x\(String(back.status, radix: 16)) sense \(back.sense.map { String(format: "%02x", $0) }.joined())")
+                    }
+                    guard back.dataIn == pattern else {
+                        fail("verify MISMATCH at LBA \(lba): \(ioSize / 1024)K region read back differs from what was written")
+                    }
+                    lba += UInt64(blocks)
+                }
+                print("  verified \(ops * ioSize / 1_048_576) MiB (\(ops) x \(ioSize / 1024)K) read back, all match")
             }
         }
     case "serve":

@@ -22,9 +22,11 @@
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "iSCSIKitDext: " fmt, ##__VA_ARGS__)
 
 static constexpr uint32_t kMaxTaskCount = 64;
-// One Apple Silicon page per task, with internally consistent constraints
-// (single segment of exactly this size) while the write path is validated.
-static constexpr uint64_t kMaxTransferSize = 16384;
+// Max bytes per task. Kept in lockstep with the daemon's dequeue/complete
+// buffers (ISCSIKIT_MAX_TRANSFER) so a single struct round trip always fits.
+// A larger transfer amortizes the fixed per-task dext<->daemon IPC cost over
+// more data: at ~10 ms/op that overhead dominated when tasks were 16 KiB.
+static constexpr uint64_t kMaxTransferSize = ISCSIKIT_MAX_TRANSFER;
 
 namespace {
 
