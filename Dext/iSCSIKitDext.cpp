@@ -497,8 +497,14 @@ kern_return_t IMPL(iSCSIKitDext, UserInitializeController)
         }
     };
 
-    setNumber(kIOMaximumSegmentCountReadKey, 1);
-    setNumber(kIOMaximumSegmentCountWriteKey, 1);
+    // A user buffer is made of discontiguous pages (16 KiB on Apple Silicon),
+    // so the segment count is what bounds a command, not the byte count: with
+    // one segment the kernel could only ever hand us one page per task. We
+    // never walk segments ourselves (data always goes through the bounce
+    // buffer from UserGetDataBuffer), so allow enough 4 KiB-aligned segments
+    // to cover a full transfer.
+    setNumber(kIOMaximumSegmentCountReadKey, kMaxTransferSize / 4096);
+    setNumber(kIOMaximumSegmentCountWriteKey, kMaxTransferSize / 4096);
     setNumber(kIOMaximumSegmentByteCountReadKey, kMaxTransferSize);
     setNumber(kIOMaximumSegmentByteCountWriteKey, kMaxTransferSize);
     setNumber(kIOMinimumSegmentAlignmentByteCountKey, 4);
@@ -507,6 +513,34 @@ kern_return_t IMPL(iSCSIKitDext, UserInitializeController)
 
     kern_return_t ret = UserReportHBAConstraints(constraints);
     constraints->release();
+    if (ret != kIOReturnSuccess) {
+        return ret;
+    }
+
+    // The per-command transfer ceiling is NOT taken from the constraints
+    // dictionary: the SDK states UserReportHBAConstraints ignores
+    // kIOMaximumByteCount{Read,Write}Key and that they must be set as
+    // properties on the dext. Without them the kernel keeps its default
+    // (16 KiB) regardless of the segment byte count, which is exactly the
+    // flat ~2 MiB/s at every I/O size measured with kMaxTransferSize = 1 MiB.
+    OSDictionary * limits = OSDictionary::withCapacity(2);
+    if (!limits) {
+        return kIOReturnNoMemory;
+    }
+    auto setLimit = [&](const char * key, uint64_t value) {
+        OSNumber * number = OSNumber::withNumber(value, 64);
+        if (number) {
+            limits->setObject(key, number);
+            number->release();
+        }
+    };
+    setLimit(kIOMaximumByteCountReadKey, kMaxTransferSize);
+    setLimit(kIOMaximumByteCountWriteKey, kMaxTransferSize);
+    ret = SetProperties(limits);
+    limits->release();
+    if (ret != kIOReturnSuccess) {
+        LOG("SetProperties(max byte count) failed: 0x%x", ret);
+    }
     return ret;
 }
 
