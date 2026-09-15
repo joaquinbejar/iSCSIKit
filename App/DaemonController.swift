@@ -58,9 +58,13 @@ final class DaemonController: ObservableObject {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = pipe
+        // Keep a copy of the daemon's output on disk: the in-app log is
+        // truncated and lost on quit, and a support request needs the trace.
+        let logFile = Self.openLogFile()
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let text = String(data: data, encoding: .utf8) else { return }
+            logFile?.write(data)
             Task { @MainActor [weak self] in
                 self?.log.append(text)
                 if let log = self?.log, log.count > 20_000 {
@@ -87,6 +91,21 @@ final class DaemonController: ObservableObject {
         } catch {
             state = .failed(error.localizedDescription)
         }
+    }
+
+    /// ~/Library/Logs/iSCSIKit/daemon.log, truncated at each start.
+    static let logURL: URL = {
+        let logs = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("Logs/iSCSIKit", isDirectory: true)
+        return logs.appendingPathComponent("daemon.log")
+    }()
+
+    private static func openLogFile() -> FileHandle? {
+        let url = logURL
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                 withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        return try? FileHandle(forWritingTo: url)
     }
 
     func stop() {

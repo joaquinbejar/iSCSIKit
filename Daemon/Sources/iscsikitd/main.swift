@@ -20,6 +20,10 @@ func fail(_ message: String) -> Never {
     exit(1)
 }
 
+// stdout is a pipe when the app runs us; without this the pump's periodic
+// stats sit in a 4 KiB stdio buffer instead of reaching the log.
+setvbuf(stdout, nil, _IOLBF, 0)
+
 let arguments = CommandLine.arguments
 guard arguments.count >= 3 else {
     fail("""
@@ -56,6 +60,14 @@ do {
         let gib = Double(capacity.bytes) / 1_073_741_824
         print("device: \(device)")
         print("capacity: \(capacity.blocks) blocks x \(capacity.blockSize) B = \(String(format: "%.1f", gib)) GiB")
+        // Byte 7 of standard INQUIRY: CmdQue (bit 1) tells the host it may
+        // keep several tagged commands outstanding; without it macOS issues
+        // one task at a time to the LUN.
+        let raw = try initiator.inquiryData(lun: url.lun)
+        if raw.count > 7 {
+            let b7 = raw[7]
+            print("inquiry byte 7: 0x\(String(format: "%02x", b7))  CmdQue=\(b7 & 0x02 != 0 ? 1 : 0)  version=\(raw[2])  bytes=\(raw.count)")
+        }
     case "verify":
         // Exercises the exact raw-CDB path `serve` uses: READ(16) of LBA 0.
         let initiator = try Initiator()

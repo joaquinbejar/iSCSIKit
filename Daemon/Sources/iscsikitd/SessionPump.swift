@@ -126,6 +126,18 @@ final class SessionPump: @unchecked Sendable {
 
     private let queue = DispatchQueue(label: "com.taunais.iscsikit.pump")
     private var sessions: [UInt64: Session] = [:]
+
+    /// Where the pump's time goes, printed every few seconds while busy so
+    /// the next bottleneck is measured rather than guessed.
+    private struct Stats {
+        var tasks = 0
+        var dequeueSeconds = 0.0
+        var completeSeconds = 0.0
+        var maxInFlight = 0
+        var lastReport = Date()
+    }
+    private var stats = Stats()
+    private var statsTimer: DispatchSourceTimer?
     private var dext: DextClient?
     private var powerNotifier: io_object_t = 0
     private var powerRootPort: io_connect_t = 0
@@ -162,6 +174,12 @@ final class SessionPump: @unchecked Sendable {
                 self?.handleTask(taskID)
             }
             try dext.registerCallback()
+
+            let timer = DispatchSource.makeTimerSource(queue: queue)
+            timer.schedule(deadline: .now() + 5, repeating: 5)
+            timer.setEventHandler { [weak self] in self?.reportStats() }
+            timer.resume()
+            statsTimer = timer
         }
 
         // Register targets OFF the pump queue: UserCreateTargetForID blocks in
@@ -188,7 +206,10 @@ final class SessionPump: @unchecked Sendable {
     private func handleTask(_ taskID: UInt64) {
         guard let dext else { return }
         do {
+            let t0 = Date()
             let (descriptor, dataOut) = try dext.dequeueTask(taskID)
+            stats.dequeueSeconds += Date().timeIntervalSince(t0)
+            stats.tasks += 1
             guard let session = sessions[descriptor.targetID] else {
                 try completeFailed(taskID: taskID, targetID: descriptor.targetID)
                 return
@@ -238,6 +259,7 @@ final class SessionPump: @unchecked Sendable {
             }
             // libiscsi now has output pending; make sure POLLOUT is watched.
             session.loop.update()
+            stats.maxInFlight = max(stats.maxInFlight, session.initiator.inFlight)
         } catch {
             FileHandle.standardError.write(Data("task \(taskID) failed: \(error)\n".utf8))
             try? completeFailed(taskID: taskID, targetID: 0)
@@ -264,7 +286,9 @@ final class SessionPump: @unchecked Sendable {
                 response.senseLength = UInt8(count)
             }
             do {
+                let t0 = Date()
                 try dext.completeTask(response, dataIn: result.dataIn)
+                stats.completeSeconds += Date().timeIntervalSince(t0)
             } catch {
                 FileHandle.standardError.write(Data("task \(taskID) complete failed: \(error)\n".utf8))
             }
@@ -295,6 +319,17 @@ final class SessionPump: @unchecked Sendable {
             FileHandle.standardError.write(
                 Data("target \(targetID) reconnect failed: \(error)\n".utf8))
         }
+    }
+
+    private func reportStats() {
+        guard stats.tasks > 0 else { return }
+        let seconds = Date().timeIntervalSince(stats.lastReport)
+        let perTaskDequeue = stats.dequeueSeconds / Double(stats.tasks) * 1000
+        let perTaskComplete = stats.completeSeconds / Double(stats.tasks) * 1000
+        print(String(format: "pump: %d tasks in %.1fs (%.0f/s), dequeue %.2f ms + complete %.2f ms per task, max in flight %d",
+                     stats.tasks, seconds, Double(stats.tasks) / seconds,
+                     perTaskDequeue, perTaskComplete, stats.maxInFlight))
+        stats = Stats()
     }
 
     private func completeFailed(taskID: UInt64, targetID: UInt64) throws {

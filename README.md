@@ -100,7 +100,12 @@ the signatures and entitlements of any build.
 
 ## Performance
 
-Sequential throughput (gigabit, queue depth 1): the transport reaches ~83 MiB/s read / ~50 MiB/s write, while the current driver path is bounded to ~1.5 MiB/s by a 16 KiB max transfer and serial task issue. Full tables and analysis in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Sequential throughput over gigabit: the transport reaches ~83 MiB/s read /
+~50 MiB/s write. Through the driver, each task is one 16 KiB page (a
+SCSIControllerDriverKit limit for virtual controllers), so throughput scales
+with tasks in flight: a single raw `dd` stream gets ~9.7 MB/s, eight
+concurrent readers ~47 MB/s. Full tables and analysis in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
 ## Requirements
 

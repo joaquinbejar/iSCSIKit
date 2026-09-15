@@ -28,13 +28,15 @@ region it wrote and compares it to the pattern, aborting on any mismatch.
 
 ## Full stack (dext block device, `dd if=/dev/rdiskN`)
 
-| I/O size | Read MiB/s |
-|---------:|-----------:|
-| 16 KiB   | ~1.5       |
+| Daemon pump | Workload | Throughput | Tasks/s | Tasks in flight |
+|---|---|---:|---:|---:|
+| serial, sync libiscsi (build 22) | one `dd`, any `bs` | ~2.1 MB/s | ~130 | 1 |
+| async event loop (build 28) | one `dd bs=1m` | 9.65 MB/s | ~590 | 1 |
+| async event loop (build 29) | 8 parallel `dd bs=1m`, 128 MiB each | **47.3 MB/s** aggregate | up to 4245 | 8 |
 
-Measured live with `iostat`: ~93 tps × 16 KiB. Larger `dd` block sizes do not
-help, because the dext caps each transfer at `kMaxTransferSize` (16 KiB) and
-the kernel issues those transfers serially.
+Measured live with `iostat` and with the pump's own counters (printed every
+5 s to `~/Library/Logs/iSCSIKit/daemon.log`): dequeue + complete cost
+0.05–0.2 ms per task, zero transport errors during the parallel run.
 
 Writes cannot be measured through the stack at all: on Apple Silicon macOS 26
 the kernel stages a zero-filled buffer for outbound transfers
@@ -43,29 +45,28 @@ read-only policy rejects every write before it reaches the target regardless.
 
 ## Reading the numbers
 
-The same 16 KiB I/O costs **1.00 ms** at the transport but **~10.7 ms** through
-the full stack (~93 tps measured with `iostat`), so full-stack read is
-~1.5 MiB/s against the transport's 15.6 MiB/s at that size. The NAS and network
-are idle (< 0.5 ms RTT); the difference is the per-task round trip
-kernel → dext → daemon (async IOUserClient notify, struct copy, `CreateMapping`)
-→ synchronous libiscsi call → back. How much of that ~9.7 ms gap is fixed
-per-task overhead versus scaling with transfer size is not established by these
-two data points; the 16 KiB full-stack figure is the only full-stack number
-measured so far.
+**A task is one page, and that is a framework limit.** `SCSIUserParallelTask`
+carries a single `fBufferIOVMAddr` and no scatter-gather list; a virtual
+controller has no DART to make a multi-page user buffer IOVM-contiguous.
+Declaring more than one segment per command (builds 25/26) made every request
+larger than one page fail with EIO in the kernel before it reached the dext.
+So the dext reports one segment of 16 KiB (one Apple Silicon page), and the
+kernel breaks larger requests into 16 KiB tasks.
 
-That the transport writes succeed and verify, while the identical CDBs fail
-through the dext with a zeroed payload, is direct evidence that the write
-defect lives in the kernel's DriverKit staging, not in iSCSIKit's transport.
+**Throughput therefore comes from tasks in flight.** The serial pump waited
+for each command (~1.7 ms round trip including two IOKit calls), which capped
+everything at ~130 tasks/s. The async pump keeps as many commands outstanding
+as the kernel hands it: one `dd` on the raw device is inherently queue depth 1
+(the block layer's breaker issues the 16 KiB pieces of each `read()` one
+after another), which gives 9.65 MB/s; eight concurrent readers reach 8 in
+flight and 47 MB/s, over half the transport ceiling, with the per-task IPC
+now at 0.05 ms. Filesystem reads with read-ahead and multiple processes
+behave like the second case, not the first.
 
-Two levers would raise full-stack throughput, both independent of the write
-defect:
-
-1. **Larger `kMaxTransferSize`** (16 KiB → up to 1 MiB, the protocol maximum),
-   so each round trip carries more data. Whether this scales throughput
-   linearly depends on how much of the per-task cost is fixed; it must be
-   measured, not assumed.
-2. **Queue depth > 1** — letting several tasks be outstanding, which the serial
-   pump does not do today.
+The transport writes succeed and verify while the identical CDBs fail
+through the dext with a zeroed payload, which is direct evidence that the
+write defect lives in the kernel's DriverKit staging, not in iSCSIKit's
+transport.
 
 ## Reproducing
 

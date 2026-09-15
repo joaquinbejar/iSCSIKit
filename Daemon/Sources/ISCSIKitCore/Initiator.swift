@@ -173,6 +173,15 @@ public final class Initiator {
         return TargetCapacity(blocks: capacity.returned_lba &+ 1, blockSize: capacity.block_length)
     }
 
+    /// Raw standard INQUIRY data (what the kernel sees through the dext).
+    public func inquiryData(lun: Int32) throws -> Data {
+        guard let task = iscsi_inquiry_sync(context, lun, 0, 0, 255) else { throw lastError() }
+        defer { scsi_free_scsi_task(task) }
+        guard task.pointee.status == SCSI_STATUS_GOOD.rawValue,
+              task.pointee.datain.size > 0, let base = task.pointee.datain.data else { throw lastError() }
+        return Data(bytes: base, count: Int(task.pointee.datain.size))
+    }
+
     public func inquiry(lun: Int32) throws -> String {
         guard let task = iscsi_inquiry_sync(context, lun, 0, 0, 255) else { throw lastError() }
         defer { scsi_free_scsi_task(task) }
