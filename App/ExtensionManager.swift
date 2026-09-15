@@ -11,6 +11,10 @@ final class ExtensionManager: NSObject, ObservableObject {
         case activating
         case needsApproval
         case activated
+        /// Deactivation accepted; macOS unloads a dext only at the next
+        /// reboot, and System Settings keeps listing it until then.
+        case removalPendingReboot
+        case removed
         case failed(String)
     }
 
@@ -18,6 +22,7 @@ final class ExtensionManager: NSObject, ObservableObject {
 
     private let log = Logger(subsystem: "com.taunais.iscsikit", category: "ExtensionManager")
     private var propertiesProbe: OSSystemExtensionRequest?
+    private var deactivation: OSSystemExtensionRequest?
 
     override init() {
         super.init()
@@ -52,6 +57,7 @@ final class ExtensionManager: NSObject, ObservableObject {
             queue: .main
         )
         request.delegate = self
+        deactivation = request
         OSSystemExtensionManager.shared.submitRequest(request)
     }
 }
@@ -86,6 +92,14 @@ extension ExtensionManager: OSSystemExtensionRequestDelegate {
                  didFinishWithResult result: OSSystemExtensionRequest.Result) {
         guard request !== propertiesProbe else { return }
         log.info("finished: \(String(describing: result))")
+        if request === deactivation {
+            deactivation = nil
+            // A dext is never unloaded live: the OS reports the removal as
+            // completing after reboot, and the extension stays visible in
+            // System Settings until then. Say so instead of "active".
+            status = result == .willCompleteAfterReboot ? .removalPendingReboot : .removed
+            return
+        }
         status = .activated
     }
 
@@ -96,6 +110,7 @@ extension ExtensionManager: OSSystemExtensionRequestDelegate {
             status = .unknown
             return
         }
+        if request === deactivation { deactivation = nil }
         log.error("failed: \(error.localizedDescription)")
         status = .failed(error.localizedDescription)
     }

@@ -22,7 +22,15 @@ struct ContentView: View {
                     driverStatusView
                     Spacer()
                     Button("Install Driver") { extensionManager.activate() }
-                    Button("Remove Driver") { extensionManager.deactivate() }
+                    Button("Remove Driver") {
+                        // Sessions die with the driver; stop the pump first so
+                        // the daemon does not spin on a vanished user client.
+                        daemon.stop()
+                        extensionManager.deactivate()
+                    }
+                    .disabled(extensionManager.status == .unknown
+                              || extensionManager.status == .removed
+                              || extensionManager.status == .removalPendingReboot)
                 }
                 .padding(4)
             }
@@ -132,6 +140,12 @@ struct ContentView: View {
         case .activated:
             Label("Driver active", systemImage: "checkmark.circle.fill")
                 .foregroundStyle(.green)
+        case .removalPendingReboot:
+            Label("Driver removed; macOS unloads it on the next restart (it stays listed in System Settings until then)",
+                  systemImage: "arrow.counterclockwise.circle")
+                .foregroundStyle(.orange)
+        case .removed:
+            Label("Driver removed", systemImage: "circle.dashed")
         case .failed(let message):
             Label(message, systemImage: "xmark.circle.fill")
                 .foregroundStyle(.red)
