@@ -64,8 +64,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleIconFile: AppIcon
-        CFBundleShortVersionString: 0.1.0
-        CFBundleVersion: 1
+        CFBundleShortVersionString: 0.1.1
+        CFBundleVersion: 2
         LSMinimumSystemVersion: "15.0"
         NSHumanReadableCopyright: "© 2026 Joaquin Bejar Garcia. MIT License."
         NSLocalNetworkUsageDescription: "iSCSIKit connects to iSCSI targets on your local network to present their storage as disks."

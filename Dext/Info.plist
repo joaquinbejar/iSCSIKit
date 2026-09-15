@@ -17,9 +17,7 @@
 	<key>CFBundleShortVersionString</key>
 	<string>0.1.1</string>
 	<key>CFBundleVersion</key>
-	<string>20</string>
-	<key>OSBundleUsageDescription</key>
-	<string>iSCSIKit virtual SCSI host bus adapter. Presents iSCSI LUNs as local disks.</string>
+	<string>22</string>
 	<key>IOKitPersonalities</key>
 	<dict>
 		<key>iSCSIKitDext</key>
@@ -30,15 +28,15 @@
 			<string>com.apple.iokit.IOSCSIParallelFamily</string>
 			<key>IOClass</key>
 			<string>IOUserSCSIParallelInterfaceController</string>
-			<key>IOUserClass</key>
-			<string>iSCSIKitDext</string>
-			<key>IOUserServerName</key>
+			<key>IOMatchCategory</key>
 			<string>com.taunais.iscsi-initiator.dext</string>
 			<key>IOProviderClass</key>
 			<string>IOUserResources</string>
 			<key>IOResourceMatch</key>
 			<string>IOKit</string>
-			<key>IOMatchCategory</key>
+			<key>IOUserClass</key>
+			<string>iSCSIKitDext</string>
+			<key>IOUserServerName</key>
 			<string>com.taunais.iscsi-initiator.dext</string>
 			<key>UserClientProperties</key>
 			<dict>
@@ -49,5 +47,7 @@
 			</dict>
 		</dict>
 	</dict>
+	<key>OSBundleUsageDescription</key>
+	<string>iSCSIKit virtual SCSI host bus adapter. Presents iSCSI LUNs as local disks.</string>
 </dict>
 </plist>

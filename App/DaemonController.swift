@@ -29,7 +29,15 @@ final class DaemonController: ObservableObject {
         let fallback = FileManager.default.isExecutableFile(atPath: bundled)
             ? bundled
             : "/opt/homebrew/bin/iscsikitd"
-        daemonPath = UserDefaults.standard.string(forKey: "daemonPath") ?? fallback
+        // A saved path from an older build can point at a daemon that no
+        // longer exists (the CLI moved into the nested bundle); never let a
+        // stale preference shadow a working default.
+        if let saved = UserDefaults.standard.string(forKey: "daemonPath"),
+           FileManager.default.isExecutableFile(atPath: saved) {
+            daemonPath = saved
+        } else {
+            daemonPath = fallback
+        }
     }
 
     func start(configPath: URL) {
