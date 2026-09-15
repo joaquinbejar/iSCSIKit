@@ -44,11 +44,14 @@ read-only policy rejects every write before it reaches the target regardless.
 ## Reading the numbers
 
 The same 16 KiB I/O costs **1.00 ms** at the transport but **~10.7 ms** through
-the full stack — roughly a 10× tax per task, so full-stack read is ~1.5 MiB/s
-against the transport's 15.6 MiB/s. The bottleneck is not the NAS or the
-network (both idle at < 0.5 ms RTT) but the per-task round trip
+the full stack (~93 tps measured with `iostat`), so full-stack read is
+~1.5 MiB/s against the transport's 15.6 MiB/s at that size. The NAS and network
+are idle (< 0.5 ms RTT); the difference is the per-task round trip
 kernel → dext → daemon (async IOUserClient notify, struct copy, `CreateMapping`)
-→ synchronous libiscsi call → back.
+→ synchronous libiscsi call → back. How much of that ~9.7 ms gap is fixed
+per-task overhead versus scaling with transfer size is not established by these
+two data points; the 16 KiB full-stack figure is the only full-stack number
+measured so far.
 
 That the transport writes succeed and verify, while the identical CDBs fail
 through the dext with a zeroed payload, is direct evidence that the write
@@ -57,10 +60,12 @@ defect lives in the kernel's DriverKit staging, not in iSCSIKit's transport.
 Two levers would raise full-stack throughput, both independent of the write
 defect:
 
-1. **Larger `kMaxTransferSize`** (16 KiB → 128 KiB / 512 KiB / 1 MiB). At the
-   measured ~10.7 ms/op, 512 KiB per op would already give ~46 MiB/s.
-2. **Queue depth > 1** — letting several tasks be outstanding multiplies
-   throughput on top of (1).
+1. **Larger `kMaxTransferSize`** (16 KiB → up to 1 MiB, the protocol maximum),
+   so each round trip carries more data. Whether this scales throughput
+   linearly depends on how much of the per-task cost is fixed; it must be
+   measured, not assumed.
+2. **Queue depth > 1** — letting several tasks be outstanding, which the serial
+   pump does not do today.
 
 ## Reproducing
 

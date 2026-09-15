@@ -126,6 +126,12 @@ do {
                 guard r.status == 0 else {
                     fail("\(label) failed at LBA \(lba): status 0x\(String(r.status, radix: 16)) sense \(r.sense.map { String(format: "%02x", $0) }.joined())")
                 }
+                // A short read still returns GOOD; a throughput figure computed
+                // from fewer bytes than requested would be a lie. Require the
+                // full transfer.
+                if pattern == nil, r.dataIn.count != ioSize {
+                    fail("\(label) short read at LBA \(lba): got \(r.dataIn.count) of \(ioSize) bytes")
+                }
                 worst = max(worst, Date().timeIntervalSince(t))
                 lba += UInt64(blocks)
             }
