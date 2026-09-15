@@ -10,17 +10,118 @@ private let kMessageCanSystemSleep: natural_t = 0xE000_0270
 private let kMessageSystemWillSleep: natural_t = 0xE000_0280
 private let kMessageSystemHasPoweredOn: natural_t = 0xE000_0300
 
+/// Drives one libiscsi session from the pump queue: watches its socket with
+/// dispatch sources and lets libiscsi make progress whenever the socket is
+/// readable, writable (only while it has output pending) or a second has
+/// passed (command timeouts). This is what lets many commands be in flight
+/// on one session without threads: every libiscsi call still happens on
+/// `queue`.
+final class SessionLoop {
+    private let initiator: Initiator
+    private let queue: DispatchQueue
+    private var reader: DispatchSourceRead?
+    private var writer: DispatchSourceWrite?
+    private var writerActive = false
+    private var timer: DispatchSourceTimer?
+    /// Called on `queue` when libiscsi reports a transport failure.
+    var onTransportError: ((Error) -> Void)?
+
+    init(initiator: Initiator, queue: DispatchQueue) {
+        self.initiator = initiator
+        self.queue = queue
+    }
+
+    func start() {
+        attach()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in self?.pump(events: 0) }
+        timer.resume()
+        self.timer = timer
+    }
+
+    /// After a reconnect libiscsi owns a new socket; re-arm the sources on it.
+    func restart() {
+        detach()
+        attach()
+    }
+
+    func stop() {
+        detach()
+        timer?.cancel()
+        timer = nil
+    }
+
+    /// Re-evaluate whether libiscsi wants POLLOUT; call after queueing work.
+    func update() {
+        let wantsWrite = initiator.wantedEvents & POLLOUT != 0
+        if wantsWrite, !writerActive {
+            writer?.resume()
+            writerActive = true
+        } else if !wantsWrite, writerActive {
+            writer?.suspend()
+            writerActive = false
+        }
+    }
+
+    private func attach() {
+        let fd = initiator.fileDescriptor
+        guard fd >= 0 else { return }
+        let reader = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        reader.setEventHandler { [weak self] in self?.pump(events: POLLIN) }
+        reader.resume()
+        self.reader = reader
+        let writer = DispatchSource.makeWriteSource(fileDescriptor: fd, queue: queue)
+        writer.setEventHandler { [weak self] in self?.pump(events: POLLOUT) }
+        // Created suspended; `update` resumes it only while output is pending.
+        self.writer = writer
+        writerActive = false
+        update()
+    }
+
+    private func detach() {
+        reader?.cancel()
+        reader = nil
+        // A suspended source must be resumed before it can be cancelled.
+        if let writer {
+            if !writerActive { writer.resume() }
+            writer.cancel()
+        }
+        writer = nil
+        writerActive = false
+    }
+
+    private func pump(events: Int32) {
+        do {
+            try initiator.service(events: events)
+        } catch {
+            onTransportError?(error)
+            return
+        }
+        update()
+    }
+}
+
 /// Bridges one or more iSCSI sessions to the dext and pumps SCSI tasks
 /// between the kernel and the remote targets until killed.
 ///
 /// Thread-safety: every mutable access happens on `queue` (the dext callback,
-/// power notifications, and signal handling are all pinned to it), which is
-/// what makes the unchecked Sendable conformance sound. libiscsi contexts are
-/// not thread-safe; each session's context is only ever touched on `queue`.
+/// libiscsi socket events, power notifications and signal handling are all
+/// pinned to it), which is what makes the unchecked Sendable conformance
+/// sound. libiscsi contexts are not thread-safe; each session's context is
+/// only ever touched on `queue`.
 final class SessionPump: @unchecked Sendable {
-    struct Session {
+    final class Session {
         let initiator: Initiator
         let url: Initiator.TargetURL
+        let loop: SessionLoop
+        var reconnecting = false
+
+        init(initiator: Initiator, url: Initiator.TargetURL, loop: SessionLoop) {
+            self.initiator = initiator
+            self.url = url
+            self.loop = loop
+        }
     }
 
     private let queue = DispatchQueue(label: "com.taunais.iscsikit.pump")
@@ -43,7 +144,14 @@ final class SessionPump: @unchecked Sendable {
                 try initiator.connect(to: url)
                 let device = try initiator.inquiry(lun: url.lun)
                 let capacity = try initiator.readCapacity(lun: url.lun)
-                sessions[targetID] = Session(initiator: initiator, url: url)
+                let loop = SessionLoop(initiator: initiator, queue: queue)
+                let session = Session(initiator: initiator, url: url, loop: loop)
+                loop.onTransportError = { [weak self, weak session] error in
+                    guard let self, let session else { return }
+                    self.reconnect(session, targetID: targetID, reason: "\(error)")
+                }
+                loop.start()
+                sessions[targetID] = session
                 let gib = Double(capacity.bytes) / 1_073_741_824
                 print("target \(targetID): \(device) — \(url.description), \(String(format: "%.1f", gib)) GiB")
             }
@@ -73,13 +181,14 @@ final class SessionPump: @unchecked Sendable {
 
     // MARK: - Task pump (always on `queue`)
 
+    /// Dequeues one task from the dext and queues it on the session without
+    /// waiting for the answer, so up to the dext's slot count can be in
+    /// flight on the wire at once; `finish` completes it when libiscsi calls
+    /// back.
     private func handleTask(_ taskID: UInt64) {
         guard let dext else { return }
         do {
             let (descriptor, dataOut) = try dext.dequeueTask(taskID)
-            let nonzero = dataOut.reduce(0) { $1 != 0 ? $0 + 1 : $0 }
-            let stageOffset = withUnsafeBytes(of: descriptor.reserved) { $0.load(as: UInt16.self) }
-            print("task \(taskID): cdb 0x\(String(format: "%02x", descriptor.cdb.0)) dir \(descriptor.direction) len \(descriptor.transferLength) payload \(dataOut.count)B nz \(nonzero) stage 0x\(String(stageOffset, radix: 16))")
             guard let session = sessions[descriptor.targetID] else {
                 try completeFailed(taskID: taskID, targetID: descriptor.targetID)
                 return
@@ -90,16 +199,13 @@ final class SessionPump: @unchecked Sendable {
                 Data($0.prefix(Int(descriptor.cdbLength)))
             }
 
-            // Read-only guard: the write data path is broken on Apple Silicon
-            // macOS 26 (the kernel stages zeros), so any medium-modifying
-            // command that reached the target would corrupt the LUN. Reject
-            // them here with WRITE PROTECTED sense instead of sending them,
-            // and never let a write op touch the disk. Remove this guard only
-            // when the OS write path is fixed and verified.
             // Default-deny read-only guard: anything not on the allowlist is
             // rejected before it can reach the transport, so no destructive
-            // command (SANITIZE, WRITE SAME, UNMAP, FORMAT, WRITE LONG, an
-            // unknown/vendor opcode, …) can ever touch the disk.
+            // command (WRITE, SANITIZE, WRITE SAME, UNMAP, FORMAT, WRITE LONG,
+            // an unknown/vendor opcode, …) can ever touch the disk. The write
+            // data path is broken on Apple Silicon macOS 26 anyway (the kernel
+            // stages zeros); remove this guard only once that is fixed and
+            // verified.
             if !ReadOnlyPolicy.isAllowed(cdb: cdbData) {
                 try completeWriteProtected(taskID: descriptor.taskID,
                                            targetID: descriptor.targetID)
@@ -117,53 +223,77 @@ final class SessionPump: @unchecked Sendable {
             // Address the LUN the session actually logged into, not
             // descriptor.lun: the virtual HBA always presents LUN 0, so the
             // kernel's task carries 0 while the remote LUN may be any value.
-            let result = try executeWithReconnect(
-                session: session,
+            let targetID = descriptor.targetID
+            let responseTaskID = descriptor.taskID
+            let outCount = dataOut.count
+            try session.initiator.executeAsync(
                 lun: session.url.lun,
                 cdb: cdbData,
                 direction: direction,
                 transferLength: descriptor.transferLength,
-                dataOut: direction == .write
-                    ? dataOut.prefix(Int(descriptor.transferLength))
-                    : nil
-            )
-
-            var response = ISCSIKitTaskResponse()
-            response.taskID = descriptor.taskID
-            response.targetID = descriptor.targetID
-            response.status = result.status
-            response.bytesTransferred = direction == .write
-                ? UInt64(dataOut.count)
-                : UInt64(result.dataIn.count)
-            withUnsafeMutableBytes(of: &response.sense) { senseBuffer in
-                let count = min(result.sense.count, senseBuffer.count)
-                result.sense.copyBytes(to: senseBuffer, count: count)
-                response.senseLength = UInt8(count)
+                dataOut: direction == .write ? dataOut.prefix(Int(descriptor.transferLength)) : nil
+            ) { [weak self] outcome in
+                self?.finish(taskID: responseTaskID, targetID: targetID, direction: direction,
+                             bytesOut: outCount, outcome: outcome)
             }
-            try dext.completeTask(response, dataIn: result.dataIn)
-            print("task \(taskID): status 0x\(String(format: "%02x", result.status)) in \(result.dataIn.count)B")
+            // libiscsi now has output pending; make sure POLLOUT is watched.
+            session.loop.update()
         } catch {
             FileHandle.standardError.write(Data("task \(taskID) failed: \(error)\n".utf8))
             try? completeFailed(taskID: taskID, targetID: 0)
         }
     }
 
-    /// One transparent reconnect + retry on transport failure. iSCSI is
-    /// designed for this: the target replays nothing, we resubmit the CDB.
-    private func executeWithReconnect(session: Session, lun: Int32, cdb: Data,
-                                      direction: Initiator.TransferDirection,
-                                      transferLength: UInt32,
-                                      dataOut: Data?) throws -> Initiator.RawResult {
+    /// Completion for a queued command; runs on `queue` from the session's
+    /// socket service.
+    private func finish(taskID: UInt64, targetID: UInt64, direction: Initiator.TransferDirection,
+                        bytesOut: Int, outcome: Result<Initiator.RawResult, Error>) {
+        guard let dext else { return }
+        switch outcome {
+        case .success(let result):
+            var response = ISCSIKitTaskResponse()
+            response.taskID = taskID
+            response.targetID = targetID
+            response.status = result.status
+            response.bytesTransferred = direction == .write
+                ? UInt64(bytesOut)
+                : UInt64(result.dataIn.count)
+            withUnsafeMutableBytes(of: &response.sense) { senseBuffer in
+                let count = min(result.sense.count, senseBuffer.count)
+                result.sense.copyBytes(to: senseBuffer, count: count)
+                response.senseLength = UInt8(count)
+            }
+            do {
+                try dext.completeTask(response, dataIn: result.dataIn)
+            } catch {
+                FileHandle.standardError.write(Data("task \(taskID) complete failed: \(error)\n".utf8))
+            }
+        case .failure(let error):
+            // A transport failure (cancelled, timed out, connection lost) is
+            // reported to the kernel as a failed task, which it retries; the
+            // session itself is reconnected once, not once per task.
+            FileHandle.standardError.write(Data("task \(taskID) transport error: \(error)\n".utf8))
+            try? completeFailed(taskID: taskID, targetID: targetID)
+            if let session = sessions[targetID] {
+                reconnect(session, targetID: targetID, reason: "\(error)")
+            }
+        }
+    }
+
+    /// Transparent reconnect. iSCSI is designed for this: the target replays
+    /// nothing, in-flight commands come back cancelled (and are failed to the
+    /// kernel, which resubmits them), and the socket is re-armed.
+    private func reconnect(_ session: Session, targetID: UInt64, reason: String) {
+        guard !session.reconnecting else { return }
+        session.reconnecting = true
+        defer { session.reconnecting = false }
+        FileHandle.standardError.write(Data("target \(targetID): \(reason); reconnecting\n".utf8))
         do {
-            return try session.initiator.execute(
-                lun: lun, cdb: cdb, direction: direction,
-                transferLength: transferLength, dataOut: dataOut)
-        } catch {
-            FileHandle.standardError.write(Data("transport error (\(error)); reconnecting\n".utf8))
             try session.initiator.reconnect()
-            return try session.initiator.execute(
-                lun: lun, cdb: cdb, direction: direction,
-                transferLength: transferLength, dataOut: dataOut)
+            session.loop.restart()
+        } catch {
+            FileHandle.standardError.write(
+                Data("target \(targetID) reconnect failed: \(error)\n".utf8))
         }
     }
 
@@ -219,12 +349,7 @@ final class SessionPump: @unchecked Sendable {
         case kMessageSystemHasPoweredOn:
             print("system woke — reconnecting \(sessions.count) session(s)")
             for (targetID, session) in sessions {
-                do {
-                    try session.initiator.reconnect()
-                } catch {
-                    FileHandle.standardError.write(
-                        Data("target \(targetID) reconnect failed: \(error)\n".utf8))
-                }
+                reconnect(session, targetID: targetID, reason: "system woke")
             }
         default:
             break
@@ -240,6 +365,7 @@ final class SessionPump: @unchecked Sendable {
             print("\nshutting down")
             for targetID in sessions.keys.sorted().reversed() {
                 try? dext?.unregisterTarget(targetID)
+                sessions[targetID]?.loop.stop()
                 sessions[targetID]?.initiator.disconnect()
             }
             exit(0)

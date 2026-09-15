@@ -27,6 +27,9 @@ static constexpr uint32_t kMaxTaskCount = 64;
 // A larger transfer amortizes the fixed per-task dext<->daemon IPC cost over
 // more data: at ~10 ms/op that overhead dominated when tasks were 16 KiB.
 static constexpr uint64_t kMaxTransferSize = ISCSIKIT_MAX_TRANSFER;
+// Largest transfer one task can carry: one physically contiguous page (see
+// the constraints in UserInitializeController).
+static constexpr uint64_t kMaxTaskBytes = 16384;
 
 namespace {
 
@@ -365,6 +368,10 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
         uint64_t available = length - sizeof(ISCSIKitTaskResponse);
         uint64_t dataLength = reply.bytesTransferred < available ? reply.bytesTransferred : available;
         uint64_t copyLength = dataLength < bufferLength ? dataLength : bufferLength;
+        if (copyLength < dataLength) {
+            LOG("task %llu: read data %llu bytes truncated to buffer %llu",
+                reply.taskID, dataLength, bufferLength);
+        }
         memcpy(reinterpret_cast<void *>(bufferAddress),
                reinterpret_cast<const uint8_t *>(bytes) + sizeof(ISCSIKitTaskResponse),
                copyLength);
@@ -497,16 +504,17 @@ kern_return_t IMPL(iSCSIKitDext, UserInitializeController)
         }
     };
 
-    // A user buffer is made of discontiguous pages (16 KiB on Apple Silicon),
-    // so the segment count is what bounds a command, not the byte count: with
-    // one segment the kernel could only ever hand us one page per task. We
-    // never walk segments ourselves (data always goes through the bounce
-    // buffer from UserGetDataBuffer), so allow enough 4 KiB-aligned segments
-    // to cover a full transfer.
-    setNumber(kIOMaximumSegmentCountReadKey, kMaxTransferSize / 4096);
-    setNumber(kIOMaximumSegmentCountWriteKey, kMaxTransferSize / 4096);
-    setNumber(kIOMaximumSegmentByteCountReadKey, kMaxTransferSize);
-    setNumber(kIOMaximumSegmentByteCountWriteKey, kMaxTransferSize);
+    // SCSIUserParallelTask carries a single fBufferIOVMAddr and no
+    // scatter-gather list, and a virtual controller has no DART to make a
+    // multi-page user buffer IOVM-contiguous. Allowing more than one segment
+    // made every request larger than one page fail with EIO before it ever
+    // reached the dext (build 25/26). So a task is bounded by one physically
+    // contiguous page: 16 KiB on Apple Silicon. Throughput has to come from
+    // queue depth (kMaxTaskCount tasks in flight), not from bigger tasks.
+    setNumber(kIOMaximumSegmentCountReadKey, 1);
+    setNumber(kIOMaximumSegmentCountWriteKey, 1);
+    setNumber(kIOMaximumSegmentByteCountReadKey, kMaxTaskBytes);
+    setNumber(kIOMaximumSegmentByteCountWriteKey, kMaxTaskBytes);
     setNumber(kIOMinimumSegmentAlignmentByteCountKey, 4);
     setNumber(kIOMaximumSegmentAddressableBitCountKey, 64);
     setNumber(kIOMinimumHBADataAlignmentMaskKey, 0xFFFFFFFFFFFFFFFF);
@@ -534,8 +542,8 @@ kern_return_t IMPL(iSCSIKitDext, UserInitializeController)
             number->release();
         }
     };
-    setLimit(kIOMaximumByteCountReadKey, kMaxTransferSize);
-    setLimit(kIOMaximumByteCountWriteKey, kMaxTransferSize);
+    setLimit(kIOMaximumByteCountReadKey, kMaxTaskBytes);
+    setLimit(kIOMaximumByteCountWriteKey, kMaxTaskBytes);
     ret = SetProperties(limits);
     limits->release();
     if (ret != kIOReturnSuccess) {
@@ -564,10 +572,20 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
                                               parallelRequest.fControllerTaskIdentifier,
                                               &buffer);
         if (ret != kIOReturnSuccess || !buffer) {
+            LOG("task %llu: UserGetDataBuffer failed 0x%x (dir %u, %llu bytes requested)",
+                parallelRequest.fControllerTaskIdentifier, ret,
+                parallelRequest.fTransferDirection,
+                parallelRequest.fRequestedTransferCount);
             *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
             return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
         }
         buffer->GetAddressRange(&range);
+        if (range.length < parallelRequest.fRequestedTransferCount) {
+            LOG("task %llu: data buffer %llu bytes < %llu requested (dir %u)",
+                parallelRequest.fControllerTaskIdentifier, range.length,
+                parallelRequest.fRequestedTransferCount,
+                parallelRequest.fTransferDirection);
+        }
     }
 
     IOLockLock(ivars->lock);

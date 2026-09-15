@@ -228,14 +228,19 @@ public final class Initiator {
             return iscsi_scsi_command_sync(context, lun, task, nil)
         }
         guard result != nil else { throw lastError() }
+        return try Self.makeResult(task: task, status: task.pointee.status, direction: direction)
+    }
 
+    /// Turns a finished libiscsi task into a RawResult, or throws when the
+    /// status is a transport sentinel rather than a SCSI status.
+    private static func makeResult(task: UnsafeMutablePointer<scsi_task>, status rawStatus: Int32,
+                                   direction: TransferDirection) throws -> RawResult {
         // libiscsi task status is a full Int32: SCSI status bytes (0x00 GOOD,
         // 0x02 CHECK CONDITION, …) fit a byte, but the transport sentinels
         // CANCELLED/ERROR/TIMEOUT are large values (>= 0x0f000000). Truncating
         // to UInt8 turned CANCELLED into GOOD and TIMEOUT into CHECK CONDITION,
         // hiding failures and defeating the reconnect path. Treat any
         // non-SCSI-status result as a transport error and throw.
-        let rawStatus = task.pointee.status
         if rawStatus < 0 || rawStatus > 0xFF {
             throw ISCSIError.libiscsi("transport failure: iscsi status 0x\(String(rawStatus, radix: 16))")
         }
@@ -262,6 +267,83 @@ public final class Initiator {
             sense = Data(fixed)
         }
         return RawResult(status: status, dataIn: dataIn, sense: sense)
+    }
+
+    // MARK: - Asynchronous execution
+
+    /// The socket libiscsi wants polled. Changes after a reconnect.
+    public var fileDescriptor: Int32 { iscsi_get_fd(context) }
+    /// POLLIN / POLLOUT mask libiscsi currently wants serviced.
+    public var wantedEvents: Int32 { iscsi_which_events(context) }
+    /// Commands currently in flight on this session.
+    public var inFlight: Int { Int(iscsi_queue_length(context)) }
+
+    /// Drives libiscsi's state machine. Call with the poll events that are
+    /// ready, or 0 periodically so it can expire timeouts.
+    public func service(events: Int32) throws {
+        try check(iscsi_service(context, events))
+    }
+
+    /// Everything a queued command must keep alive until libiscsi calls back:
+    /// the task, and for writes the payload (libiscsi may send it later, on
+    /// R2T, so it cannot live on the caller's stack).
+    private final class PendingCommand {
+        let task: UnsafeMutablePointer<scsi_task>
+        let direction: TransferDirection
+        var payload: UnsafeMutablePointer<iscsi_data>?
+        var bytes: UnsafeMutablePointer<UInt8>?
+        let completion: (Result<RawResult, Error>) -> Void
+
+        init(task: UnsafeMutablePointer<scsi_task>, direction: TransferDirection,
+             completion: @escaping (Result<RawResult, Error>) -> Void) {
+            self.task = task
+            self.direction = direction
+            self.completion = completion
+        }
+
+        deinit {
+            payload?.deinitialize(count: 1)
+            payload?.deallocate()
+            bytes?.deallocate()
+            scsi_free_scsi_task(task)
+        }
+    }
+
+    /// Queues a CDB without blocking. The completion runs on whichever thread
+    /// services this session's socket (see `service(events:)`), i.e. the
+    /// caller's event loop; it is invoked exactly once, also for cancelled
+    /// or timed-out commands (as a failure).
+    public func executeAsync(lun: Int32, cdb: Data, direction: TransferDirection,
+                             transferLength: UInt32, dataOut: Data.SubSequence? = nil,
+                             completion: @escaping (Result<RawResult, Error>) -> Void) throws {
+        var cdbBytes = [UInt8](cdb)
+        guard let task = scsi_create_task(Int32(cdbBytes.count), &cdbBytes,
+                                          direction.xferDir, Int32(transferLength)) else {
+            throw lastError()
+        }
+        let pending = PendingCommand(task: task, direction: direction, completion: completion)
+        if direction == .write, let dataOut, !dataOut.isEmpty {
+            let bytes = UnsafeMutablePointer<UInt8>.allocate(capacity: dataOut.count)
+            dataOut.copyBytes(to: UnsafeMutableBufferPointer(start: bytes, count: dataOut.count))
+            let payload = UnsafeMutablePointer<iscsi_data>.allocate(capacity: 1)
+            payload.initialize(to: iscsi_data(size: dataOut.count, data: bytes))
+            pending.bytes = bytes
+            pending.payload = payload
+        }
+
+        let callback: iscsi_command_cb = { _, status, _, privateData in
+            guard let privateData else { return }
+            let pending = Unmanaged<PendingCommand>.fromOpaque(privateData).takeRetainedValue()
+            let outcome = Result { try Initiator.makeResult(task: pending.task, status: status,
+                                                            direction: pending.direction) }
+            pending.completion(outcome)
+        }
+        let reference = Unmanaged.passRetained(pending).toOpaque()
+        let rc = iscsi_scsi_command_async(context, lun, task, callback, pending.payload, reference)
+        guard rc == 0 else {
+            Unmanaged<PendingCommand>.fromOpaque(reference).release()
+            throw lastError()
+        }
     }
 
     public func read(lun: Int32, lba: UInt64, blocks: UInt32, blockSize: UInt32) throws -> Data {
