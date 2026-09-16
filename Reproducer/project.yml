@@ -1,0 +1,50 @@
+name: RAMDiskRepro
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    macOS: "15.0"
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: 5NP3LPSUMR   # replace with your team
+
+targets:
+  RAMDiskDext:
+    type: driver-extension
+    platform: macOS
+    sources:
+      - path: RAMDiskDext
+        includes: ["*.iig", "*.cpp"]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.ramdisk-repro.dext
+        PRODUCT_NAME: com.example.ramdisk-repro.dext
+        INFOPLIST_FILE: RAMDiskDext/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: RAMDiskDext/RAMDiskDext.entitlements
+        SDKROOT: driverkit
+        DRIVERKIT_DEPLOYMENT_TARGET: "23.0"
+        OTHER_LDFLAGS: ["-framework", "SCSIControllerDriverKit"]
+
+  RAMDiskRepro:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+    dependencies:
+      - target: RAMDiskDext
+        embed: true
+        codeSign: true
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleShortVersionString: 1.0
+        CFBundleVersion: 1
+        LSMinimumSystemVersion: "15.0"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.ramdisk-repro
+        PRODUCT_NAME: RAMDiskRepro
+        CODE_SIGN_ENTITLEMENTS: App/App.entitlements
+        ENABLE_HARDENED_RUNTIME: true
