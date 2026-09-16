@@ -1,5 +1,7 @@
 # iSCSIKit: Write Data Path Investigation Report
 
+> Reported to Apple as Feedback **FB24799838** (2026-09-16).
+
 Status: OPEN PROBLEM. Reads work end to end; write payloads never become
 CPU-visible to the dext. This document is a complete, self-contained handoff
 for anyone attempting to solve it.
