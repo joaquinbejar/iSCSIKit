@@ -57,33 +57,28 @@ it against the target with libiscsi's raw passthrough, and completes it back
 
 ## Status
 
-The entire userspace stack is implemented and verified against real hardware
-(an ASUSTOR NAS with mutual CHAP and header/data digests): discovery, login,
-capacity, and raw READ(16) through the same code path `serve` uses. The last
-missing link is loading the signed dext so the kernel starts sending CDBs.
+Verified end to end on Apple Silicon macOS 26 with a notarized build against
+an ASUSTOR NAS (mutual CHAP): the driver loads, the daemon opens it, and the
+LUN appears as a disk. Reads work through the whole stack; writes do not,
+because of an OS defect, so the daemon enforces read-only access.
 
-- [x] Project skeleton (XcodeGen + SwiftPM)
-- [x] Daemon: discovery (SendTargets), login, `READ CAPACITY(16)`, `INQUIRY`
-- [x] Dext ↔ daemon transport (IOUserClient: async task notification,
-      dequeue/complete with inline payloads)
-- [x] Dext: task queue, target registry, data buffer copy in/out
-- [x] Daemon: raw CDB passthrough (`iscsikitd serve` pumps kernel CDBs to the
-      target over libiscsi)
-- [x] CHAP, including mutual (URL carries initiator credentials;
-      `LIBISCSI_CHAP_TARGET_USERNAME/PASSWORD` carry the target's), verified
-      against real hardware with header/data digests enabled
-- [x] Multi-session: `iscsikitd serve` bridges several targets at once
-- [x] Reconnection: transparent reconnect + retry on transport errors
-- [x] Sleep/wake: IOKit power notifications force a reconnect on wake
-- [x] Configuration UI: target list persisted in the app, daemon lifecycle
-      (start/stop/log) managed from the Daemon panel
-- [x] launchd integration: the app bundles `iscsikitd` and a LaunchAgent
-      (`SMAppService`) — "Install Login Agent" keeps sessions alive across
-      app quits and reconnects at login, reading the shared target config
-- [ ] First end-to-end test with loaded dext (`iscsikitd serve` + Disk Utility)
-- [ ] Shared-memory rings (`UserProcessBundledParallelTasks` + mapped command/
-      response buffers) instead of copy-per-IO — deliberately deferred until
-      the copy path is validated end-to-end
+- [x] Discovery, login, CHAP and mutual CHAP, multi-session, reconnection,
+      sleep/wake, configuration UI, launchd login agent
+- [x] Dext ↔ daemon transport (async task notification, dequeue/complete)
+      with an asynchronous pump: dozens of commands in flight per session
+- [x] Developer ID signing, notarization, DMG; entitlement model documented
+      in [docs/SIGNING.md](docs/SIGNING.md)
+- [x] Read-only enforcement: default-deny CDB allowlist with service-action
+      checks, DATA PROTECT sense for anything else
+- [ ] **Writes**: on Apple Silicon macOS 26 the kernel hands the dext a
+      zero-filled buffer for every outbound transfer
+      ([docs/WRITE-PATH-INVESTIGATION.md](docs/WRITE-PATH-INVESTIGATION.md)),
+      reported to Apple as **FB24799838**. Public reports say macOS 27 is
+      unaffected; to be verified.
+- [ ] Larger tasks are not possible: `SCSIUserParallelTask` carries a single
+      buffer address and a virtual controller has no DART, so a task is one
+      16 KiB page and throughput comes from queue depth
+      ([docs/BENCHMARKS.md](docs/BENCHMARKS.md))
 
 > **Warning**: pre-alpha storage software. Do not point it at data you care
 > about, and never connect a second initiator to a LUN that is already
