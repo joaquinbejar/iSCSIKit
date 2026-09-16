@@ -1,6 +1,6 @@
 # Feedback Assistant / DTS Incident
 
-Filed with Apple on 2026-09-16 as **FB24799838** (Developer Technologies & SDKs › DriverKit, macOS 26.6.2 25G82).
+Filed with Apple on 2026-09-16 as **FB24799838** (Developer Technologies & SDKs › DriverKit, macOS 26.6.2 25G82). DTS code-level support request **Case-ID 22255765** (same day), with the focused reproducer in `Reproducer/`.
 
 Title: SCSIControllerDriverKit: UserGetDataBuffer returns a zero-filled
 buffer for write tasks on a software-only controller (Apple Silicon,
