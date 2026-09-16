@@ -19,10 +19,29 @@ static constexpr uint64_t kDiskBytes = 64ULL * 1024 * 1024;
 static constexpr uint64_t kMaxTransfer = 16384;   // one Apple Silicon page
 
 struct RAMDiskDext_IVars {
-    IODispatchQueue * work;   // target creation and completions, never the Default queue
+    IODispatchQueue * targets;      // UserCreateTargetForID blocks until the probe completes...
+    IODispatchQueue * completions;  // ...so completions must run on a different queue
     uint8_t * disk;
     uint32_t nextTaskID;
+    // Published as IORegistry properties (ioreg -r -n RAMDiskDext -l): dext
+    // os_log output is not reliably visible, the registry always is.
+    uint64_t tasks, writes, writeBytes, writeNonzeroBytes, lastOpcode, lastStatus, createTargetResult;
 };
+
+static void publish(RAMDiskDext * dext, RAMDiskDext_IVars * v)
+{
+    OSDictionary * d = OSDictionary::withCapacity(8);
+    if (!d) return;
+    auto set = [&](const char * key, uint64_t value) {
+        OSNumber * n = OSNumber::withNumber(value, 64);
+        if (n) { d->setObject(key, n); n->release(); }
+    };
+    set("Tasks", v->tasks); set("Writes", v->writes); set("WriteBytes", v->writeBytes);
+    set("WriteNonzeroBytes", v->writeNonzeroBytes); set("LastOpcode", v->lastOpcode);
+    set("LastStatus", v->lastStatus); set("CreateTargetResult", v->createTargetResult);
+    dext->SetProperties(d);
+    d->release();
+}
 
 bool RAMDiskDext::init()
 {
@@ -35,7 +54,8 @@ void RAMDiskDext::free()
 {
     if (ivars) {
         if (ivars->disk) IOFree(ivars->disk, kDiskBytes);
-        OSSafeReleaseNULL(ivars->work);
+        OSSafeReleaseNULL(ivars->targets);
+        OSSafeReleaseNULL(ivars->completions);
         IOSafeDeleteNULL(ivars, RAMDiskDext_IVars, 1);
     }
     super::free();
@@ -51,7 +71,9 @@ kern_return_t IMPL(RAMDiskDext, Start)
     ret = SetDispatchQueue("AuxiliaryQueue", auxiliary);
     auxiliary->release();
     if (ret != kIOReturnSuccess) return ret;
-    ret = IODispatchQueue::Create("RAMDiskWork", 0, 0, &ivars->work);
+    ret = IODispatchQueue::Create("RAMDiskTargets", 0, 0, &ivars->targets);
+    if (ret != kIOReturnSuccess) return ret;
+    ret = IODispatchQueue::Create("RAMDiskCompletions", 0, 0, &ivars->completions);
     if (ret != kIOReturnSuccess) return ret;
     ivars->disk = reinterpret_cast<uint8_t *>(IOMallocZero(kDiskBytes));
     if (!ivars->disk) return kIOReturnNoMemory;
@@ -83,13 +105,17 @@ kern_return_t IMPL(RAMDiskDext, UserStartController)
 {
     // UserCreateTargetForID blocks until the target's probe I/O completes,
     // and that I/O is served by UserProcessParallelTask on the Default
-    // queue, so it must not be called from a framework callback.
+    // queue, so it must not be called from a framework callback. Wait for
+    // the controller start to settle in the kernel before creating it.
     retain();
-    ivars->work->DispatchAsync(^{
+    ivars->targets->DispatchAsync(^{
+        IOSleep(2000);
         OSDictionary * props = OSDictionary::withCapacity(1);
         if (props) {
-            LOG("create target 0: 0x%x", UserCreateTargetForID(0, props));
+            ivars->createTargetResult = UserCreateTargetForID(0, props);
+            LOG("create target 0: 0x%llx", ivars->createTargetResult);
             props->release();
+            publish(this, ivars);
         }
         release();
     });
@@ -139,6 +165,7 @@ kern_return_t IMPL(RAMDiskDext, UserProcessParallelTask)
         if (write) {
             uint64_t nonzero = 0;
             for (uint64_t i = 0; i < length; i++) nonzero += data[i] != 0;
+            ivars->writes++; ivars->writeBytes += length; ivars->writeNonzeroBytes += nonzero;
             // THE BUG: on Apple Silicon macOS 26 nonzero is always 0 here.
             LOG("WRITE lba %llu blocks %llu: %llu nonzero bytes in the buffer from UserGetDataBuffer",
                 lba, blocks, nonzero);
@@ -181,10 +208,12 @@ kern_return_t IMPL(RAMDiskDext, UserProcessParallelTask)
     SCSIUserParallelResponse * heap = IONew(SCSIUserParallelResponse, 1);   // blocks capture by value
     if (!heap) { OSSafeReleaseNULL(buffer); *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE; return kIOReturnNoMemory; }
     *heap = reply;
+    ivars->tasks++; ivars->lastOpcode = cdb[0]; ivars->lastStatus = reply.fCompletionStatus;
     completion->retain();
     retain();
-    ivars->work->DispatchAsync(^{
+    ivars->completions->DispatchAsync(^{
         ParallelTaskCompletion(completion, *heap);
+        publish(this, ivars);
         IODelete(heap, SCSIUserParallelResponse, 1);
         completion->release();
         if (buffer) buffer->release();
