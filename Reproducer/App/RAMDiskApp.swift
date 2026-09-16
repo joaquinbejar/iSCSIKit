@@ -13,7 +13,7 @@ struct RAMDiskApp: App {
                 Text("RAMDisk reproducer for FB24799838").font(.headline)
                 Text(installer.status)
                 Button("Install Driver") { installer.activate() }
-                Text("Then: diskutil list (a 64 MB \"RAMDisk repro\" disk appears), sudo diskutil eraseDisk JHFS+ T diskN, and\nlog stream --predicate 'eventMessage CONTAINS \"RAMDiskDext: WRITE\"'")
+                Text("Then: diskutil list (a 64 MB \"RAMDisk repro\" disk appears), sudo diskutil eraseDisk JHFS+ T diskN, and\nsudo log stream --predicate 'eventMessage CONTAINS \"RAMDiskDext: WRITE\"'")
                     .font(.caption).multilineTextAlignment(.center)
             }.padding(24).frame(minWidth: 520)
         }

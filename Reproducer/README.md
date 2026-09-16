@@ -24,7 +24,7 @@ System Settings.
 
 ```sh
 diskutil list                                   # "RAMDisk repro" 64 MB disk appears as diskN
-log stream --predicate 'eventMessage CONTAINS "RAMDiskDext: WRITE"' &
+sudo log stream --predicate 'eventMessage CONTAINS "RAMDiskDext: WRITE"' &
 sudo diskutil eraseDisk JHFS+ T diskN          # or: sudo dd if=/dev/urandom of=/dev/rdiskN bs=16k count=4
 ```
 
