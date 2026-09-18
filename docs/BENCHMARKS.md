@@ -9,8 +9,8 @@ separately so the cost of each is visible:
 - **Full stack** — `dd` against the block device the driver presents
   (`/dev/rdiskN`), i.e. kernel → dext → daemon → libiscsi → NAS.
 
-All runs are queue depth 1, which is what the serial task pump gives the
-kernel today. 256 MiB per I/O size for the transport runs.
+Transport runs use queue depth 1 and 256 MiB per I/O size. Full-stack runs
+include both a single reader and eight concurrent readers, as shown below.
 
 ## Transport (libiscsi direct, no dext)
 
@@ -38,10 +38,12 @@ Measured live with `iostat` and with the pump's own counters (printed every
 5 s to `~/Library/Logs/iSCSIKit/daemon.log`): dequeue + complete cost
 0.05–0.2 ms per task, zero transport errors during the parallel run.
 
-Writes cannot be measured through the stack at all: on Apple Silicon macOS 26
-the kernel stages a zero-filled buffer for outbound transfers
-([WRITE-PATH-INVESTIGATION.md](WRITE-PATH-INVESTIGATION.md)), and the daemon's
-read-only policy rejects every write before it reaches the target regardless.
+No full-stack write throughput is validated here. On Apple Silicon macOS 26,
+the measured `diskutil eraseDisk` writes arrived zero-filled, while one raw
+write delivered nonzero payload
+([WRITE-PATH-INVESTIGATION.md](WRITE-PATH-INVESTIGATION.md)). The daemon
+rejects writes by default; the local diagnostic `allowWrites` setting
+explicitly bypasses that policy.
 
 ## Reading the numbers
 
@@ -63,10 +65,11 @@ flight and 47 MB/s, over half the transport ceiling, with the per-task IPC
 now at 0.05 ms. Filesystem reads with read-ahead and multiple processes
 behave like the second case, not the first.
 
-The transport writes succeed and verify while the identical CDBs fail
-through the dext with a zeroed payload, which is direct evidence that the
-write defect lives in the kernel's DriverKit staging, not in iSCSIKit's
-transport.
+Direct transport writes succeed and verify. The failing formatting writes
+already contain zeros when inspected in the dext, before the daemon or
+iSCSI transport sees them. The raw-versus-formatting difference narrows the
+investigation to how the storage stack supplies outbound data to the dext;
+the exact kernel cause is still unconfirmed.
 
 ## Reproducing
 

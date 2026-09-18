@@ -59,8 +59,10 @@ it against the target with libiscsi's raw passthrough, and completes it back
 
 Verified end to end on Apple Silicon macOS 26 with a notarized build against
 an ASUSTOR NAS (mutual CHAP): the driver loads, the daemon opens it, and the
-LUN appears as a disk. Reads work through the whole stack; writes do not,
-because of an OS defect, so the daemon enforces read-only access.
+LUN appears as a disk. Reads work through the whole stack. Formatting with
+`diskutil eraseDisk` still receives zero-filled write payloads in the dext,
+although a raw-device write delivered nonzero data. The daemon therefore
+keeps read-only access enabled by default.
 
 - [x] Discovery, login, CHAP and mutual CHAP, multi-session, reconnection,
       sleep/wake, configuration UI, launchd login agent
@@ -70,11 +72,12 @@ because of an OS defect, so the daemon enforces read-only access.
       in [docs/SIGNING.md](docs/SIGNING.md)
 - [x] Read-only enforcement: default-deny CDB allowlist with service-action
       checks, DATA PROTECT sense for anything else
-- [ ] **Writes**: on Apple Silicon macOS 26 the kernel hands the dext a
-      zero-filled buffer for every outbound transfer
+- [ ] **Writes and formatting**: on Apple Silicon macOS 26, the measured
+      `diskutil eraseDisk` writes arrived zero-filled, while a raw
+      `dd` to `/dev/rdiskN` delivered nonzero payload
       ([docs/WRITE-PATH-INVESTIGATION.md](docs/WRITE-PATH-INVESTIGATION.md)),
-      reported to Apple as **FB24799838**. Public reports say macOS 27 is
-      unaffected; to be verified.
+      reported to Apple as **FB24799838**, DTS **22255765**. Validation on
+      macOS 27 remains pending.
 - [ ] Larger tasks are not possible: `SCSIUserParallelTask` carries a single
       buffer address and a virtual controller has no DART, so a task is one
       16 KiB page and throughput comes from queue depth

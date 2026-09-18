@@ -2,9 +2,10 @@
 
 > Reported to Apple as Feedback **FB24799838** (2026-09-16).
 
-Status: OPEN PROBLEM. Reads work end to end; write payloads never become
-CPU-visible to the dext. This document is a complete, self-contained handoff
-for anyone attempting to solve it.
+Status: OPEN PROBLEM, updated 2026-09-18. Reads work end to end. One raw
+write to `/dev/rdiskN` delivered nonzero payload, but all 60 measured writes
+from `diskutil eraseDisk` arrived zero-filled. Formatting remains blocked.
+Experiment 10 supersedes the earlier conclusion that every write fails.
 
 ## 1. Project context
 
@@ -60,8 +61,9 @@ over TCP.
 
 ## 4. The problem
 
-For WRITE tasks (`fTransferDirection == kSCSIDataTransfer_FromInitiatorToTarget`),
-the outbound payload is never observable by the dext:
+For the measured formatting WRITE tasks
+(`fTransferDirection == kSCSIDataTransfer_FromInitiatorToTarget`), the
+expected outbound payload is absent when inspected in the dext:
 
 - `diskutil eraseDisk` reaches "Wiping volume data" and fails with -69825;
   GPT writes complete with GOOD status but reading back LBA 0 over iSCSI
@@ -85,11 +87,12 @@ the outbound payload is never observable by the dext:
 | 8 | Inconsistent HBA constraints confuse staging | maxTransferSize 16384 with exactly 1 segment x 16384 bytes (fully coherent set) | Kernel dispatches 16 KB writes accordingly; payload still all zeros |
 | 9 | Payload must be read inside the documented context | Copy performed inside `UserProcessParallelTask` itself, immediately after `UserGetDataBuffer` + `GetAddressRange`; buffer never touched later | Still all zeros at capture time |
 
-## 5b. Final determination (2026-08-30)
+## 5b. Earlier interpretation (2026-08-30), superseded by experiment 10
 
-With unique task IDs, coherent constraints, correct transfer direction and
+The original interpretation was based on formatting tests, not all possible
+write origins. With unique task IDs, coherent constraints, correct transfer direction and
 the copy performed inside the documented callback context, the buffer
-returned by `UserGetDataBuffer` contains zeros for every write. Combined
+returned by `UserGetDataBuffer` contained zeros for those writes. Combined
 with binary inspection showing the kernel-side implementation zeroes a new
 buffer and copies from the original task descriptor for write tasks, the
 evidence points at the kernel's source-descriptor copy producing no data
@@ -130,8 +133,8 @@ These cost days; they are prerequisites for anyone reproducing:
    of the personality must point at `com.apple.iokit.IOSCSIParallelFamily`
    (the on-demand kext that provides the kernel-side IOClass), not
    `com.apple.kpi.iokit`.
-6. Transfers are currently clamped to 4096 bytes (`kMaxTransferSize`) while
-   investigating; reads worked fine at larger sizes before the clamp.
+6. The current tested transfer limit is 16384 bytes with one segment.
+   The earlier 4096-byte investigation clamp is no longer current.
 
 ## 7. Relevant code (repo paths)
 
@@ -143,12 +146,20 @@ These cost days; they are prerequisites for anyone reproducing:
   (RegisterCallback async, RegisterTarget, DequeueTask, CompleteTask),
   queue creation, descriptor mapping for large struct I/O.
 - `Daemon/Sources/iscsikitd/DextClient.swift`: IOKit client side.
-- `Daemon/Sources/iscsikitd/SessionPump.swift`: task pump, per-write payload
-  instrumentation (`nz` = count of nonzero payload bytes, `stage` = probe
-  result from `descriptor.reserved`).
+- `Daemon/Sources/iscsikitd/SessionPump.swift`: asynchronous task pump and
+  read-only policy, with a local diagnostic `allowWrites` opt-in.
+- Current payload instrumentation is in the dext and exposed through
+  `WriteProbe_*` IORegistry properties; older daemon logs used `nz` and `stage`.
 - `Daemon/Sources/CISCSIKitShared/include/iSCSIKitProtocol.h`: wire structs.
 
-## 8. Reproduction
+## 8. Historical reproduction
+
+These commands describe the original diagnostic build. The current daemon
+rejects writes by default. Repeating the experiment requires a disposable
+LUN and a diagnostic config with `allowWrites: true`, passed using
+`serve --config <path>`. A write-protected rejection does not exercise the
+same end-to-end failure. The standalone `Reproducer/` still needs validation
+after reboot; its dext became stuck in state U during the initial attempt.
 
 ```sh
 git clone https://github.com/joaquinbejar/iSCSIKit && cd iSCSIKit
@@ -163,11 +174,18 @@ diskutil eraseDisk APFS TEST diskN     # partition-map writes report GOOD
 .build/debug/iscsikitd verify 'iscsi://…/0'   # LBA 0 reads back all zeros
 ```
 
-The daemon prints one line per write: `cdb 0x2a dir 1 len 512 payload … nz 0`;
-`nz` stays 0 for every write including GPT headers, which are provably
-nonzero.
+Historical daemon logs printed `cdb 0x2a dir 1 len 512 payload … nz 0`
+for the formatting writes. Current builds expose `WriteProbe_*` counters in
+IORegistry. Capture before/after counters separately for raw writes and
+formatting; do not infer formatting correctness from a raw write alone.
 
-## 9. Untested avenues (ordered by expected value)
+## 9. Earlier investigation leads
+
+These leads predate experiment 10. The immediate priority is a controlled
+comparison of raw and buffered writes using the same known pattern, offset
+and length on a disposable device, followed by independent readback. Then
+validate the standalone reproducer and compare OS versions. The kernel-side
+mechanism remains a hypothesis until these paths are traced or Apple confirms it.
 
 1. **Bundled task path**: `UserMapBundledParallelTaskCommandAndResponseBuffers`
    + `UserProcessBundledParallelTasks` + `UserCompleteBundledParallelTask`.
@@ -201,9 +219,8 @@ nonzero.
 
 ## 10. Key open questions
 
-1. Is there ANY supported way for a software-only (virtual)
-   SCSIControllerDriverKit dext on Apple Silicon to read the outbound data
-   of a write task with the CPU?
+1. Why does the tested raw-device write deliver nonzero outbound data while
+   formatting writes deliver zeros to the same dext?
 2. What exactly does the kernel-side `UserGetDataBuffer` implementation do
    for `FromInitiatorToTarget` tasks: under what condition does it copy the
    caller's pages into the returned IOBufferMemoryDescriptor?
@@ -245,15 +262,25 @@ Measured on macOS 26.6.2 (25G83), Apple Silicon, dext build 31:
 | `diskutil eraseDisk APFS` | 60 | **60** | 792576 | **0** |
 
 `GetAddressRange` returned `kIOReturnSuccess` on all 61 tasks, `CreateMapping`
-also succeeded on all 61, and the two routes reported byte-identical content
-every time (`WriteProbe_RouteMismatches = 0`). The suggested change therefore
-makes no difference, and the API is not being misused: when the kernel does
-stage the data, `GetAddressRange` sees it perfectly.
+also succeeded on all 61, and both routes reported equal nonzero-byte counts
+every time (`WriteProbe_RouteMismatches = 0`). This counters the specific
+hypothesis that `GetAddressRange` fails or hides nonzero data visible through
+`CreateMapping`. The counter compares counts, not individual bytes: it does
+not establish byte-identical content for the raw write or rule out every
+possible API issue. With successful full-length access, a zero nonzero-byte
+count does establish that the inspected region is all zeros.
 
 What this corrects in the original report: the defect is **not** "every write
-task". A write issued straight to the raw device carries its payload intact.
-The payload is missing only for writes that come down the buffered path
+task". The measured raw-device write delivers nonzero payload; its count
+alone does not prove end-to-end integrity. The tested formatting path
+delivers zeros
 (`diskutil eraseDisk` fails with `-69825: Wiping volume data to prevent future
 accidental probing failed`, which is the first step that writes real data).
 That is why every test in experiments 1-9, all driven by `diskutil`, saw
 zeros, and why an isolated `dd` test appeared to work.
+
+The observed discriminator is raw-device writing versus formatting. A
+buffered-path staging defect is the working explanation, not yet a proof
+that all buffered writes fail or that every raw write is correct. A raw-only
+success previously led to an incorrect conclusion that the defect was gone;
+future validation must include formatting and byte-for-byte readback.

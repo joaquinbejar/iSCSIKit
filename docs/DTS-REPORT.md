@@ -2,9 +2,8 @@
 
 Filed with Apple on 2026-09-16 as **FB24799838** (Developer Technologies & SDKs › DriverKit, macOS 26.6.2 25G82). DTS code-level support request **Case-ID 22255765** (same day), with the focused reproducer in `Reproducer/`.
 
-Title: SCSIControllerDriverKit: UserGetDataBuffer returns a zero-filled
-buffer for write tasks on a software-only controller (Apple Silicon,
-macOS 26)
+Current title: SCSIControllerDriverKit: formatting writes arrive zero-filled
+while a raw-device write delivers payload (Apple Silicon, macOS 26)
 
 Area: DriverKit / SCSIControllerDriverKit
 
@@ -12,20 +11,30 @@ Area: DriverKit / SCSIControllerDriverKit
 
 The DTS hypothesis (GetAddressRange failing because the descriptor is an
 IOMemoryDescriptor) was measured and does not hold: it returns success on every
-task and CreateMapping yields byte-identical content. The defect is real but
+task and CreateMapping yields equal nonzero-byte counts. The defect is
 narrower than first reported: it depends on where the write comes from. See
 experiment 10 in WRITE-PATH-INVESTIGATION.md.
+
+| Origin | Tasks | All-zero payloads | Nonzero bytes |
+|---|---:|---:|---:|
+| `dd` to `/dev/rdiskN` | 1 | 0 | 16112 / 16384 |
+| `diskutil eraseDisk APFS` | 60 | 60 | 0 / 792576 |
+
+Both access APIs succeeded on all 61 tasks. `WriteProbe_RouteMismatches`
+compares nonzero-byte counts, so zero mismatches does not establish
+byte-for-byte equality of nonzero payloads. These measurements come from
+the main dext, build 31. The standalone RAMDisk reproducer is not yet
+validated: its dext became stuck in state U and needs a retry after reboot.
 
 ## Summary
 
 On Apple Silicon macOS 26.6.2 (25G83), a software-only (virtual)
-`IOUserSCSIParallelInterfaceController` dext never receives the outbound
-payload of write tasks. The `IOBufferMemoryDescriptor` returned by
-`UserGetDataBuffer` is zero-filled for every
-`FromInitiatorToTarget` task, while the read direction through the very
-same buffer works correctly (the dext fills it; the caller receives the
-data). This makes it impossible to implement a software-backed SCSI
-controller (for example an iSCSI initiator) on Apple Silicon macOS 26.
+`IOUserSCSIParallelInterfaceController` dext receives zero-filled buffers
+for the measured `diskutil eraseDisk` writes, while one raw-device write
+delivers nonzero payload. Reads work end to end. Formatting APFS remains
+blocked; raw-write success does not resolve the formatting failure. The
+working hypothesis is a difference in kernel staging between raw and
+buffered paths, with the exact cause still unconfirmed.
 
 ## Conditions verified before filing
 
@@ -73,13 +82,16 @@ controller (for example an iSCSI initiator) on Apple Silicon macOS 26.
 
 Complete open-source reproducer: https://github.com/joaquinbejar/iSCSIKit
 (tag v0.1.1-preview, commit e0e30c7 or later). Steps in docs/WRITE-PATH-INVESTIGATION.md section 8;
-the daemon logs one line per write with a nonzero-byte count of the
-payload observed by the dext, which stays 0 for every write.
+historical daemon logs showed zero payloads during formatting. Current
+diagnostic builds publish `WriteProbe_*` counters in IORegistry. The daemon
+is read-only by default; reproducing end-to-end formatting requires the
+diagnostic opt-in on a disposable LUN. `Reproducer/README.md` describes the
+standalone RAMDisk candidate, whose execution is still unverified.
 
 ## Questions
 
-1. Under what condition does the kernel copy the caller's outbound data
-   into the buffer returned by `UserGetDataBuffer`?
+1. What differs in the kernel's outbound-data staging between raw-device
+   writes and the formatting path used by `diskutil eraseDisk`?
 2. Is a software-only SCSIControllerDriverKit controller a supported
    configuration on Apple Silicon, and if so, what is the intended write
    data path?
