@@ -144,7 +144,14 @@ final class SessionPump: @unchecked Sendable {
 
     /// Connects every entry, registers targets 0..n-1 with the dext, and
     /// blocks pumping tasks until SIGINT.
-    func run(entries: [DaemonConfig.TargetEntry]) throws -> Never {
+    /// Opt-in from the config file; false keeps every write off the wire.
+    private var allowWrites = false
+
+    func run(entries: [DaemonConfig.TargetEntry], allowWrites: Bool = false) throws -> Never {
+        self.allowWrites = allowWrites
+        if allowWrites {
+            print("WARNING: allowWrites is on — medium-modifying commands will reach the target")
+        }
         try queue.sync {
             for (index, entry) in entries.enumerated() {
                 let targetID = UInt64(index)
@@ -227,7 +234,7 @@ final class SessionPump: @unchecked Sendable {
             // data path is broken on Apple Silicon macOS 26 anyway (the kernel
             // stages zeros); remove this guard only once that is fixed and
             // verified.
-            if !ReadOnlyPolicy.isAllowed(cdb: cdbData) {
+            if !allowWrites, !ReadOnlyPolicy.isAllowed(cdb: cdbData) {
                 try completeWriteProtected(taskID: descriptor.taskID,
                                            targetID: descriptor.targetID)
                 print("task \(taskID): cdb 0x\(String(format: "%02x", descriptor.cdb.0)) REJECTED (read-only)")

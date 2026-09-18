@@ -224,3 +224,36 @@ faulting frames:
 ```
 
 `0x10cb7f8c000` was the task's `fBufferIOVMAddr`.
+
+## Experiment 10 (2026-09-18): the write's origin is the discriminator
+
+Apple DTS (case 22255765) suggested the cause was that `UserGetDataBuffer`
+returns an `IOMemoryDescriptor`, not an `IOBufferMemoryDescriptor`, so
+`GetAddressRange` would be failing and `CreateMapping` was needed instead.
+
+That hypothesis was tested directly. The dext now captures the return code of
+`GetAddressRange`, additionally maps the same descriptor with `CreateMapping`,
+counts the nonzero payload bytes reachable through **both** routes, and
+publishes the totals as IORegistry properties (dext `os_log` output is not
+visible on this system, the registry always is).
+
+Measured on macOS 26.6.2 (25G83), Apple Silicon, dext build 31:
+
+| Write origin | Tasks | Tasks with zero payload | Bytes | Nonzero bytes |
+|---|---:|---:|---:|---:|
+| `dd` to `/dev/rdiskN` (raw, unbuffered) | 1 | 0 | 16384 | 16112 |
+| `diskutil eraseDisk APFS` | 60 | **60** | 792576 | **0** |
+
+`GetAddressRange` returned `kIOReturnSuccess` on all 61 tasks, `CreateMapping`
+also succeeded on all 61, and the two routes reported byte-identical content
+every time (`WriteProbe_RouteMismatches = 0`). The suggested change therefore
+makes no difference, and the API is not being misused: when the kernel does
+stage the data, `GetAddressRange` sees it perfectly.
+
+What this corrects in the original report: the defect is **not** "every write
+task". A write issued straight to the raw device carries its payload intact.
+The payload is missing only for writes that come down the buffered path
+(`diskutil eraseDisk` fails with `-69825: Wiping volume data to prevent future
+accidental probing failed`, which is the first step that writes real data).
+That is why every test in experiments 1-9, all driven by `diskutil`, saw
+zeros, and why an isolated `dd` test appeared to work.

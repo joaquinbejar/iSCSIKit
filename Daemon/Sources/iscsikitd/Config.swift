@@ -15,6 +15,12 @@ struct DaemonConfig: Codable {
 
     var targets: [TargetEntry]
 
+    /// Lets medium-modifying commands through to the target. Absent or false
+    /// means the read-only policy stays on, which is the only safe default
+    /// while the write path is being validated: a write that reached the LUN
+    /// with a zeroed payload would corrupt it.
+    var allowWrites: Bool?
+
     static var defaultPath: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("iSCSIKit/targets.json")

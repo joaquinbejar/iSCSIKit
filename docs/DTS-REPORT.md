@@ -8,6 +8,14 @@ macOS 26)
 
 Area: DriverKit / SCSIControllerDriverKit
 
+## Update 2026-09-18 (after DTS reply)
+
+The DTS hypothesis (GetAddressRange failing because the descriptor is an
+IOMemoryDescriptor) was measured and does not hold: it returns success on every
+task and CreateMapping yields byte-identical content. The defect is real but
+narrower than first reported: it depends on where the write comes from. See
+experiment 10 in WRITE-PATH-INVESTIGATION.md.
+
 ## Summary
 
 On Apple Silicon macOS 26.6.2 (25G83), a software-only (virtual)

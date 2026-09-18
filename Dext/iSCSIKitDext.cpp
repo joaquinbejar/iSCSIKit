@@ -58,6 +58,10 @@ struct TaskSlot {
     // context for UserGetDataBuffer) so later stages never touch the buffer.
     uint8_t * staged;
     uint64_t stagedLength;
+    // Mapping of the task's data buffer created with CreateMapping. The
+    // documented way to reach an IOMemoryDescriptor's bytes; GetAddressRange
+    // is LOCALONLY and only meaningful for a descriptor the dext created.
+    IOMemoryMap * map;
 };
 
 }  // namespace
@@ -71,7 +75,45 @@ struct iSCSIKitDext_IVars {
     // UserCreateTargetForID blocks until the kernel finishes probing the
     // target, and the probe's own callbacks need the RPC queues free.
     IODispatchQueue * targetOpsQueue;
+    // Write-path probe, published to the IORegistry (ioreg -r -n iSCSIKitDext -l).
+    // Compares what the two ways of reaching the data buffer actually contain,
+    // because dext os_log output is not visible on this system.
+    uint64_t probeWrites, probeRangeRC, probeRangeLength, probeRangeNonzero;
+    uint64_t probeMapRC, probeMapLength, probeMapNonzero, probeRequested;
+    // Cumulative, so one good write cannot hide a zeroed one.
+    uint64_t probeZeroPayloadWrites, probeTotalBytes, probeTotalNonzero, probeMismatches;
 };
+
+// Publishes the write probe. Only called for write tasks (a blocking RPC, so
+// never on the read hot path).
+static void publishWriteProbe(iSCSIKitDext * dext, iSCSIKitDext_IVars * v)
+{
+    OSDictionary * d = OSDictionary::withCapacity(8);
+    if (!d) {
+        return;
+    }
+    auto set = [&](const char * key, uint64_t value) {
+        OSNumber * n = OSNumber::withNumber(value, 64);
+        if (n) {
+            d->setObject(key, n);
+            n->release();
+        }
+    };
+    set("WriteProbe_Writes", v->probeWrites);
+    set("WriteProbe_Requested", v->probeRequested);
+    set("WriteProbe_GetAddressRangeRC", v->probeRangeRC);
+    set("WriteProbe_GetAddressRangeLength", v->probeRangeLength);
+    set("WriteProbe_GetAddressRangeNonzeroBytes", v->probeRangeNonzero);
+    set("WriteProbe_CreateMappingRC", v->probeMapRC);
+    set("WriteProbe_CreateMappingLength", v->probeMapLength);
+    set("WriteProbe_CreateMappingNonzeroBytes", v->probeMapNonzero);
+    set("WriteProbe_ZeroPayloadWrites", v->probeZeroPayloadWrites);
+    set("WriteProbe_TotalBytes", v->probeTotalBytes);
+    set("WriteProbe_TotalNonzeroBytes", v->probeTotalNonzero);
+    set("WriteProbe_RouteMismatches", v->probeMismatches);
+    dext->SetProperties(d);
+    d->release();
+}
 
 bool iSCSIKitDext::init()
 {
@@ -192,6 +234,7 @@ bool iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
                 responses[failCount] = response;
                 failCount++;
                 slot.completion = nullptr;
+                OSSafeReleaseNULL(slot.map);
                 OSSafeReleaseNULL(slot.buffer);
                 if (slot.staged) {
                     IOFree(slot.staged, slot.stagedLength);
@@ -344,6 +387,7 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     SCSIUserParallelTask task = found->task;
     OSAction * completion = found->completion;
     IOBufferMemoryDescriptor * buffer = found->buffer;
+    IOMemoryMap * map = found->map;
     uint64_t bufferAddress = found->bufferAddress;
     uint64_t bufferLength = found->bufferLength;
     if (found->staged) {
@@ -356,6 +400,7 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     }
     found->completion = nullptr;
     found->buffer = nullptr;
+    found->map = nullptr;
     found->bufferAddress = 0;
     found->bufferLength = 0;
     found->state = SlotState::free_;
@@ -376,6 +421,7 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
                reinterpret_cast<const uint8_t *>(bytes) + sizeof(ISCSIKitTaskResponse),
                copyLength);
     }
+    OSSafeReleaseNULL(map);
     OSSafeReleaseNULL(buffer);
 
     SCSIUserParallelResponse response = {};
@@ -566,6 +612,9 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     // UserProcessParallelTask. The slot keeps it until completion.
     IOBufferMemoryDescriptor * buffer = nullptr;
     IOAddressSegment range = {};
+    IOMemoryMap * map = nullptr;
+    uint64_t mapAddress = 0, mapLength = 0;
+    kern_return_t rangeRC = kIOReturnError, mapRC = kIOReturnError;
     if (parallelRequest.fTransferDirection != kISCSIKitNoData &&
         parallelRequest.fRequestedTransferCount > 0) {
         kern_return_t ret = UserGetDataBuffer(parallelRequest.fTargetID,
@@ -579,12 +628,19 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
             *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
             return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
         }
-        buffer->GetAddressRange(&range);
-        if (range.length < parallelRequest.fRequestedTransferCount) {
-            LOG("task %llu: data buffer %llu bytes < %llu requested (dir %u)",
-                parallelRequest.fControllerTaskIdentifier, range.length,
-                parallelRequest.fRequestedTransferCount,
-                parallelRequest.fTransferDirection);
+        // GetAddressRange is LOCALONLY: it reports the local state of a
+        // descriptor the dext created itself, so for a descriptor handed over
+        // by the kernel it can fail or report nothing useful. Keep its result
+        // for comparison, but reach the bytes through a real mapping.
+        rangeRC = buffer->GetAddressRange(&range);
+        mapRC = buffer->CreateMapping(0, 0, 0, 0, 0, &map);
+        if (mapRC == kIOReturnSuccess && map) {
+            mapAddress = map->GetAddress();
+            mapLength = map->GetLength();
+        }
+        if (mapAddress == 0 && range.address == 0) {
+            LOG("task %llu: no way to reach the data buffer (range 0x%x, map 0x%x)",
+                parallelRequest.fControllerTaskIdentifier, rangeRC, mapRC);
         }
     }
 
@@ -613,8 +669,11 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     completion->retain();
     slot->completion = completion;
     slot->buffer = buffer;
-    slot->bufferAddress = range.address;
-    slot->bufferLength = range.length;
+    slot->map = map;
+    // Prefer the address that is known to work for the inbound copy, and fall
+    // back to the mapping when GetAddressRange reported nothing usable.
+    slot->bufferAddress = range.address != 0 ? range.address : mapAddress;
+    slot->bufferLength = range.address != 0 ? range.length : mapLength;
     slot->bufferIOVA = parallelRequest.fBufferIOVMAddr;
     // Duplicate-task-ID detection: Apple DTS diagnoses zeroed write buffers
     // as wrong-task lookups caused by reused controller task IDs.
@@ -632,14 +691,59 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     if (parallelRequest.fTransferDirection == kISCSIKitWrite &&
         parallelRequest.fRequestedTransferCount > 0) {
         uint64_t stageLength = parallelRequest.fRequestedTransferCount;
+        // Count the payload through both routes before deciding, and publish
+        // the comparison: this is what tells us whether the kernel stages the
+        // outbound data somewhere GetAddressRange cannot see.
+        uint64_t rangeNonzero = 0, mapNonzero = 0;
+        if (range.address != 0 && stageLength <= range.length) {
+            const uint8_t * p = reinterpret_cast<const uint8_t *>(range.address);
+            for (uint64_t i = 0; i < stageLength; i++) {
+                rangeNonzero += p[i] != 0;
+            }
+        }
+        if (mapAddress != 0 && stageLength <= mapLength) {
+            const uint8_t * p = reinterpret_cast<const uint8_t *>(mapAddress);
+            for (uint64_t i = 0; i < stageLength; i++) {
+                mapNonzero += p[i] != 0;
+            }
+        }
+        ivars->probeWrites++;
+        ivars->probeRequested = stageLength;
+        ivars->probeRangeRC = static_cast<uint32_t>(rangeRC);
+        ivars->probeRangeLength = range.length;
+        ivars->probeRangeNonzero = rangeNonzero;
+        ivars->probeMapRC = static_cast<uint32_t>(mapRC);
+        ivars->probeMapLength = mapLength;
+        ivars->probeMapNonzero = mapNonzero;
+        ivars->probeTotalBytes += stageLength;
+        ivars->probeTotalNonzero += mapNonzero > rangeNonzero ? mapNonzero : rangeNonzero;
+        if (rangeNonzero == 0 && mapNonzero == 0) {
+            ivars->probeZeroPayloadWrites++;
+        }
+        if (rangeNonzero != mapNonzero) {
+            ivars->probeMismatches++;
+        }
+
+        // Stage from the route that actually carries the data; the mapping is
+        // the documented one, so it wins when both are usable.
+        uint64_t sourceAddress = 0, sourceLength = 0;
+        if (mapAddress != 0 && stageLength <= mapLength && (mapNonzero > 0 || rangeNonzero == 0)) {
+            sourceAddress = mapAddress;
+            sourceLength = mapLength;
+        } else if (range.address != 0) {
+            sourceAddress = range.address;
+            sourceLength = range.length;
+        }
         // A write whose payload cannot be fully captured must FAIL, never be
         // silently sent as zeros to the target.
-        if (range.address == 0 || stageLength > range.length) {
+        if (sourceAddress == 0 || stageLength > sourceLength) {
             slot->state = SlotState::free_;
             slot->completion = nullptr;
             OSSafeReleaseNULL(completion);
             ivars->activeTaskIDs &= ~taskBit;
+            slot->map = nullptr;
             IOLockUnlock(ivars->lock);
+            OSSafeReleaseNULL(map);
             OSSafeReleaseNULL(buffer);
             *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
             return kIOReturnNoMemory;
@@ -650,12 +754,14 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
             slot->completion = nullptr;
             OSSafeReleaseNULL(completion);
             ivars->activeTaskIDs &= ~taskBit;
+            slot->map = nullptr;
             IOLockUnlock(ivars->lock);
+            OSSafeReleaseNULL(map);
             OSSafeReleaseNULL(buffer);
             *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
             return kIOReturnNoMemory;
         }
-        memcpy(staged, reinterpret_cast<const void *>(range.address), stageLength);
+        memcpy(staged, reinterpret_cast<const void *>(sourceAddress), stageLength);
         slot->staged = staged;
         slot->stagedLength = stageLength;
         for (uint64_t i = 0; i < stageLength; i++) {
@@ -666,8 +772,13 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
         }
     }
     iSCSIKitUserClient * client = ivars->userClient;
+    bool isWrite = parallelRequest.fTransferDirection == kISCSIKitWrite &&
+                   parallelRequest.fRequestedTransferCount > 0;
     IOLockUnlock(ivars->lock);
 
+    if (isWrite) {
+        publishWriteProbe(this, ivars);
+    }
     client->NotifyTaskPending(parallelRequest.fControllerTaskIdentifier);
     *response = kSCSIServiceResponse_Request_In_Process;
     return kIOReturnSuccess;
