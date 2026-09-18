@@ -22,6 +22,11 @@ System Settings.
 
 ## Reproduce
 
+IMPORTANT: exercise it with `diskutil eraseDisk`, not with a raw `dd` to
+`/dev/rdiskN`. A raw unbuffered write carries its payload intact; only writes
+coming down the buffered path arrive zero-filled (see experiment 10 in
+docs/WRITE-PATH-INVESTIGATION.md).
+
 ```sh
 diskutil list                                   # "RAMDisk repro" 64 MB disk appears as diskN
 sudo log stream --predicate 'eventMessage CONTAINS "RAMDiskDext: WRITE"' &
