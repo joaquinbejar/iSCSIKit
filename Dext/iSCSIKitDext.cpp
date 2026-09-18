@@ -10,6 +10,7 @@
 #include <DriverKit/IOKitKeys.h>
 #include <DriverKit/OSDictionary.h>
 #include <DriverKit/OSNumber.h>
+#include <DriverKit/OSArray.h>
 #include <DriverKit/OSData.h>
 #include <DriverKit/IOBufferMemoryDescriptor.h>
 #include <DriverKit/IOMemoryMap.h>
@@ -82,6 +83,14 @@ struct iSCSIKitDext_IVars {
     uint64_t probeMapRC, probeMapLength, probeMapNonzero, probeRequested;
     // Cumulative, so one good write cannot hide a zeroed one.
     uint64_t probeZeroPayloadWrites, probeTotalBytes, probeTotalNonzero, probeMismatches;
+    // Bytes that actually differ between the two routes (memcmp, not counts).
+    uint64_t probeRouteDiffBytes;
+    // Last kProbeLog write tasks, so a raw write and a formatting write can be
+    // told apart instead of being averaged together.
+    static constexpr uint32_t kProbeLog = 32;
+    uint64_t logOpcode[kProbeLog], logLBA[kProbeLog], logLength[kProbeLog];
+    uint64_t logRangeNZ[kProbeLog], logMapNZ[kProbeLog], logDiff[kProbeLog];
+    uint32_t logIndex, logCount;
 };
 
 // Publishes the write probe. Only called for write tasks (a blocking RPC, so
@@ -111,6 +120,33 @@ static void publishWriteProbe(iSCSIKitDext * dext, iSCSIKitDext_IVars * v)
     set("WriteProbe_TotalBytes", v->probeTotalBytes);
     set("WriteProbe_TotalNonzeroBytes", v->probeTotalNonzero);
     set("WriteProbe_RouteMismatches", v->probeMismatches);
+    set("WriteProbe_RouteDiffBytes", v->probeRouteDiffBytes);
+
+    // Parallel arrays, oldest first: one entry per recent write task.
+    auto column = [&](const char * key, const uint64_t * values) {
+        OSArray * a = OSArray::withCapacity(v->logCount);
+        if (!a) {
+            return;
+        }
+        uint32_t start = v->logCount < iSCSIKitDext_IVars::kProbeLog
+            ? 0 : v->logIndex;
+        for (uint32_t i = 0; i < v->logCount; i++) {
+            OSNumber * n = OSNumber::withNumber(
+                values[(start + i) % iSCSIKitDext_IVars::kProbeLog], 64);
+            if (n) {
+                a->setObject(n);
+                n->release();
+            }
+        }
+        d->setObject(key, a);
+        a->release();
+    };
+    column("WriteProbe_Log_Opcode", v->logOpcode);
+    column("WriteProbe_Log_LBA", v->logLBA);
+    column("WriteProbe_Log_Length", v->logLength);
+    column("WriteProbe_Log_RangeNonzero", v->logRangeNZ);
+    column("WriteProbe_Log_MapNonzero", v->logMapNZ);
+    column("WriteProbe_Log_RouteDiffBytes", v->logDiff);
     dext->SetProperties(d);
     d->release();
 }
@@ -259,6 +295,18 @@ bool iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
 
 kern_return_t iSCSIKitDext::DaemonRegisterTarget(uint64_t targetID)
 {
+    // Fresh counters per session, so one experiment cannot be read as another.
+    IOLockLock(ivars->lock);
+    ivars->probeWrites = 0;
+    ivars->probeZeroPayloadWrites = 0;
+    ivars->probeTotalBytes = 0;
+    ivars->probeTotalNonzero = 0;
+    ivars->probeMismatches = 0;
+    ivars->probeRouteDiffBytes = 0;
+    ivars->logIndex = 0;
+    ivars->logCount = 0;
+    IOLockUnlock(ivars->lock);
+
     if (!ivars->targetOpsQueue) {
         return kIOReturnNotReady;
     }
@@ -707,6 +755,39 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
                 mapNonzero += p[i] != 0;
             }
         }
+        // The counts above can match while the bytes differ, so compare the
+        // two routes byte by byte before claiming they agree.
+        uint64_t routeDiff = 0;
+        bool routesComparable = range.address != 0 && mapAddress != 0 &&
+            stageLength <= range.length && stageLength <= mapLength;
+        if (routesComparable) {
+            const uint8_t * a = reinterpret_cast<const uint8_t *>(range.address);
+            const uint8_t * b = reinterpret_cast<const uint8_t *>(mapAddress);
+            for (uint64_t i = 0; i < stageLength; i++) {
+                routeDiff += a[i] != b[i];
+            }
+        }
+        ivars->probeRouteDiffBytes += routeDiff;
+
+        // WRITE(10)/(12) carry a 4-byte LBA, WRITE(16) an 8-byte one.
+        uint64_t lba = 0;
+        const uint8_t * cdbBytes = parallelRequest.fCommandDescriptorBlock;
+        uint32_t lbaWidth = cdbBytes[0] == 0x8A ? 8 : 4;
+        for (uint32_t i = 0; i < lbaWidth; i++) {
+            lba = (lba << 8) | cdbBytes[2 + i];
+        }
+        uint32_t slotIndex = ivars->logIndex;
+        ivars->logOpcode[slotIndex] = cdbBytes[0];
+        ivars->logLBA[slotIndex] = lba;
+        ivars->logLength[slotIndex] = stageLength;
+        ivars->logRangeNZ[slotIndex] = rangeNonzero;
+        ivars->logMapNZ[slotIndex] = mapNonzero;
+        ivars->logDiff[slotIndex] = routesComparable ? routeDiff : 0xFFFFFFFF;
+        ivars->logIndex = (slotIndex + 1) % iSCSIKitDext_IVars::kProbeLog;
+        if (ivars->logCount < iSCSIKitDext_IVars::kProbeLog) {
+            ivars->logCount++;
+        }
+
         ivars->probeWrites++;
         ivars->probeRequested = stageLength;
         ivars->probeRangeRC = static_cast<uint32_t>(rangeRC);

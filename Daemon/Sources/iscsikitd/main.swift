@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import ISCSIKitCore
 
@@ -6,6 +7,10 @@ import ISCSIKitCore
 //   iscsikitd discover <portal>
 //   iscsikitd info <iscsi-url>
 //   iscsikitd verify <iscsi-url>                     (raw READ(16) smoke test)
+//   iscsikitd readback <iscsi-url> --lba N [--blocks M]
+//                                                    (independent READ over
+//                                                     libiscsi: sha256 of a
+//                                                     region, bypassing the dext)
 //   iscsikitd bench <iscsi-url> [--mib N] [--write --lba START]
 //                                                    (sequential throughput, no dext)
 //   iscsikitd serve <iscsi-url> [<iscsi-url>...]     (needs the dext installed)
@@ -31,6 +36,7 @@ guard arguments.count >= 3 else {
       iscsikitd discover <portal>
       iscsikitd info <iscsi-url>
       iscsikitd verify <iscsi-url>
+      iscsikitd readback <iscsi-url> --lba N [--blocks M]           (sha256 of a region, no dext)
       iscsikitd bench <iscsi-url> [--mib N] [--write --lba START]   (transport-level throughput)
       iscsikitd serve <iscsi-url> [<iscsi-url>...]
       iscsikitd serve --config [path]   (default: ~/Library/Application Support/iSCSIKit/targets.json)
@@ -87,6 +93,43 @@ do {
         }
         let zeros = result.dataIn.allSatisfy { $0 == 0 }
         print("READ(16) OK: \(result.dataIn.count) bytes from LBA 0\(zeros ? " (all zeros)" : "")")
+    case "readback":
+        // Independent verification path: reads a region straight over
+        // libiscsi, so what it reports never passed through the dext.
+        var lba: UInt64? = nil
+        var blocks: UInt32 = 32
+        var i = 3
+        while i < arguments.count {
+            switch arguments[i] {
+            case "--lba": i += 1; lba = UInt64(arguments[i])
+            case "--blocks": i += 1; blocks = UInt32(arguments[i]) ?? blocks
+            default: fail("unknown readback option: \(arguments[i])")
+            }
+            i += 1
+        }
+        guard let startLBA = lba else { fail("readback requires --lba N") }
+        let initiator = try Initiator(initiatorName: "iqn.2026-08.com.taunais.iscsikit:readback")
+        let url = try initiator.parseURL(arguments[2])
+        try initiator.connect(to: url)
+        defer { initiator.disconnect() }
+        let capacity = try initiator.readCapacity(lun: url.lun)
+        var cdb = [UInt8](repeating: 0, count: 16)
+        cdb[0] = 0x88  // READ(16)
+        withUnsafeBytes(of: startLBA.bigEndian) { cdb.replaceSubrange(2..<10, with: $0) }
+        withUnsafeBytes(of: blocks.bigEndian) { cdb.replaceSubrange(10..<14, with: $0) }
+        let length = blocks * capacity.blockSize
+        let result = try initiator.execute(lun: url.lun, cdb: Data(cdb),
+                                           direction: .read, transferLength: length)
+        guard result.status == 0 else {
+            fail("READ(16) failed at LBA \(startLBA): status 0x\(String(result.status, radix: 16)) sense \(result.sense.map { String(format: "%02x", $0) }.joined())")
+        }
+        guard result.dataIn.count == Int(length) else {
+            fail("short read at LBA \(startLBA): \(result.dataIn.count) of \(length) bytes")
+        }
+        let digest = SHA256.hash(data: result.dataIn).map { String(format: "%02x", $0) }.joined()
+        let nonzero = result.dataIn.reduce(0) { $1 != 0 ? $0 + 1 : $0 }
+        print("LBA \(startLBA) + \(blocks) blocks (\(length) B): sha256 \(digest)")
+        print("  nonzero bytes: \(nonzero) of \(length)")
     case "bench":
         // Sequential throughput of the iSCSI transport itself, through the
         // same execute() path `serve` uses, at queue depth 1 (which is what
