@@ -21,6 +21,11 @@ struct DaemonConfig: Codable {
     /// with a zeroed payload would corrupt it.
     var allowWrites: Bool?
 
+    /// Logs every command with its decoded LBA and the status the target
+    /// returned. Noisy, so it is opt-in; indispensable when diagnosing which
+    /// command in a sequence actually fails.
+    var traceTasks: Bool?
+
     static var defaultPath: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("iSCSIKit/targets.json")

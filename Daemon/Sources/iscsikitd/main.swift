@@ -233,6 +233,7 @@ do {
     case "serve":
         let entries: [DaemonConfig.TargetEntry]
         var allowWrites = false
+        var traceTasks = false
         if arguments[2] == "--config" {
             let path = arguments.count > 3
                 ? URL(fileURLWithPath: arguments[3])
@@ -240,11 +241,12 @@ do {
             let config = try DaemonConfig.load(from: path)
             entries = config.targets
             allowWrites = config.allowWrites ?? false
+            traceTasks = config.traceTasks ?? false
             guard !entries.isEmpty else { fail("no targets in \(path.path)") }
         } else {
             entries = arguments[2...].map { DaemonConfig.TargetEntry(url: $0) }
         }
-        try SessionPump().run(entries: entries, allowWrites: allowWrites)
+        try SessionPump().run(entries: entries, allowWrites: allowWrites, traceTasks: traceTasks)
     default:
         fail("unknown command: \(arguments[1])")
     }

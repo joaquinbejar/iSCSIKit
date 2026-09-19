@@ -146,9 +146,67 @@ final class SessionPump: @unchecked Sendable {
     /// blocks pumping tasks until SIGINT.
     /// Opt-in from the config file; false keeps every write off the wire.
     private var allowWrites = false
+    /// Opt-in from the config file: log every command with its LBA and result.
+    private var traceTasks = false
 
-    func run(entries: [DaemonConfig.TargetEntry], allowWrites: Bool = false) throws -> Never {
+    /// Decodes the CDB far enough to say what the command actually targets.
+    /// A failing format is diagnosed by which command failed and where, not
+    /// by the payload, so this prints opcode, LBA and block count for every
+    /// command the kernel issues.
+    private static func describe(_ cdb: Data) -> String {
+        guard let opcode = cdb.first else { return "empty" }
+        func be(_ offset: Int, _ width: Int) -> UInt64 {
+            var value: UInt64 = 0
+            for i in 0..<width where offset + i < cdb.count {
+                value = (value << 8) | UInt64(cdb[cdb.startIndex + offset + i])
+            }
+            return value
+        }
+        let name: String
+        var lba: UInt64?
+        var blocks: UInt64?
+        switch opcode {
+        case 0x00: name = "TEST UNIT READY"
+        case 0x03: name = "REQUEST SENSE"
+        case 0x04: name = "FORMAT UNIT"
+        case 0x08: name = "READ(6)";  lba = be(1, 3) & 0x1FFFFF; blocks = be(4, 1)
+        case 0x0A: name = "WRITE(6)"; lba = be(1, 3) & 0x1FFFFF; blocks = be(4, 1)
+        case 0x12: name = "INQUIRY"
+        case 0x15: name = "MODE SELECT(6)"
+        case 0x1A: name = "MODE SENSE(6)"
+        case 0x1B: name = "START STOP UNIT"
+        case 0x1E: name = "PREVENT ALLOW MEDIUM REMOVAL"
+        case 0x25: name = "READ CAPACITY(10)"
+        case 0x28: name = "READ(10)";  lba = be(2, 4); blocks = be(7, 2)
+        case 0x2A: name = "WRITE(10)"; lba = be(2, 4); blocks = be(7, 2)
+        case 0x2F: name = "VERIFY(10)"; lba = be(2, 4); blocks = be(7, 2)
+        case 0x35: name = "SYNCHRONIZE CACHE(10)"; lba = be(2, 4); blocks = be(7, 2)
+        case 0x41: name = "WRITE SAME(10)"; lba = be(2, 4); blocks = be(7, 2)
+        case 0x42: name = "UNMAP"
+        case 0x48: name = "SANITIZE"
+        case 0x4D: name = "LOG SENSE"
+        case 0x55: name = "MODE SELECT(10)"
+        case 0x5A: name = "MODE SENSE(10)"
+        case 0x88: name = "READ(16)";  lba = be(2, 8); blocks = be(10, 4)
+        case 0x8A: name = "WRITE(16)"; lba = be(2, 8); blocks = be(10, 4)
+        case 0x8F: name = "VERIFY(16)"; lba = be(2, 8); blocks = be(10, 4)
+        case 0x91: name = "SYNCHRONIZE CACHE(16)"; lba = be(2, 8); blocks = be(10, 4)
+        case 0x93: name = "WRITE SAME(16)"; lba = be(2, 8); blocks = be(10, 4)
+        case 0x9E: name = "SERVICE ACTION IN(16)/\(String(format: "%02x", cdb.count > 1 ? cdb[cdb.startIndex + 1] & 0x1F : 0))"
+        case 0xA0: name = "REPORT LUNS"
+        case 0xA3: name = "MAINTENANCE IN"
+        default:   name = "opcode 0x\(String(format: "%02x", opcode))"
+        }
+        var text = name
+        if let lba { text += " lba \(lba)" }
+        if let blocks { text += " blocks \(blocks)" }
+        return text
+    }
+
+    func run(entries: [DaemonConfig.TargetEntry], allowWrites: Bool = false,
+             traceTasks: Bool = false) throws -> Never {
         self.allowWrites = allowWrites
+        self.traceTasks = traceTasks
         if allowWrites {
             print("WARNING: allowWrites is on — medium-modifying commands will reach the target")
         }
@@ -241,6 +299,11 @@ final class SessionPump: @unchecked Sendable {
                 return
             }
 
+            if traceTasks {
+                let nonzero = dataOut.reduce(0) { $1 != 0 ? $0 + 1 : $0 }
+                print("task \(taskID) -> \(Self.describe(cdbData)) len \(descriptor.transferLength) dir \(descriptor.direction) payloadNonzero \(nonzero)")
+            }
+
             let direction: Initiator.TransferDirection
             switch UInt32(descriptor.direction) {
             case kISCSIKitWrite.rawValue: direction = .write
@@ -280,6 +343,11 @@ final class SessionPump: @unchecked Sendable {
         guard let dext else { return }
         switch outcome {
         case .success(let result):
+            if traceTasks, result.status != 0 {
+                print("task \(taskID) <- status 0x\(String(format: "%02x", result.status)) sense \(result.sense.map { String(format: "%02x", $0) }.joined())")
+            } else if traceTasks {
+                print("task \(taskID) <- GOOD in \(result.dataIn.count)B")
+            }
             var response = ISCSIKitTaskResponse()
             response.taskID = taskID
             response.targetID = targetID
