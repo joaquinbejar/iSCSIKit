@@ -1,0 +1,65 @@
+Kernel panic captured 2026-09-19 while iSCSIKit's virtual SCSI controller was
+the only SCSI device on the machine, minutes after a failing
+`diskutil eraseDisk MS-DOS TEST MBR` on a 16 GiB iSCSI LUN (dext build 33,
+allowWrites and traceTasks enabled for diagnosis).
+
+The machine rebooted on its own. Panic text as shown by macOS:
+
+panic(cpu 8 caller 0xfffffe0051acc2f8): [kalloc.type2.288]: element modified after free (off:56, val:0x000000ff00000004, sz:288, ptr:0xfffffe2524c63c80)
+   56: 0x000000ff00000004
+  128: 0x0000000100000000
+Debugger message: panic
+OS version: 25G83
+Kernel version: Darwin Kernel Version 25.6.0: Fri Jul 31 19:17:26 PDT 2026; root:xnu-12377.161.14~5/RELEASE_ARM64_T6041
+secure boot?: YES
+roots installed: 0
+
+Panicked task 0xfffffe1a9006b960: 0 pages, 939 threads: pid 0: kernel_task
+Panicked thread: 0xfffffe2aee563780, backtrace: 0xfffffeae48d1b110, tid: 19029770
+          lr: 0xfffffe00511ca288  fp: 0xfffffeae48d1b1b0
+          lr: 0xfffffe005134cd24  fp: 0xfffffeae48d1b220
+          lr: 0xfffffe005134acb8  fp: 0xfffffeae48d1b2e0
+          lr: 0xfffffe0051179e9c  fp: 0xfffffeae48d1b2f0
+          lr: 0xfffffe00511ca5a8  fp: 0xfffffeae48d1b810
+          lr: 0xfffffe0051ac2fd0  fp: 0xfffffeae48d1b830
+          lr: 0xfffffe0051acc2f8  fp: 0xfffffeae48d1bce0
+          lr: 0xfffffe005124f1fc  fp: 0xfffffeae48d1bd70
+          lr: 0xfffffe00511dbaa8  fp: 0xfffffeae48d1bd80
+          lr: 0xfffffe00518e2cec  fp: 0xfffffeae48d1bda0
+          lr: 0xfffffe0050548e90  fp: 0xfffffeae48d1bdc0
+          lr: 0xfffffe0050557cc0  fp: 0xfffffeae48d1bde0
+          lr: 0xfffffe0050545dc4  fp: 0xfffffeae48d1be00
+          lr: 0xfffffe0050572b4c  fp: 0xfffffeae48d1be60
+          lr: 0xfffffe0050562e10  fp: 0xfffffeae48d1bf00
+          lr: 0xfffffe0050562fd4  fp: 0xfffffeae48d1bf20
+          lr: 0xfffffe005117ab6c  fp: 0x0000000000000000
+      Kernel Extensions in backtrace:
+         com.apple.iokit.IOSCSIArchitectureModelFamily(545.100.10)[58CA76A3-BF4F-3460-A042-E8DFC13368B8]@0xfffffe0050543f60->0xfffffe005056188f
+         com.apple.iokit.IOSCSIBlockCommandsDevice(545.100.10)[B6D639C6-19D6-39ED-9F52-7DEA4A8C7819]@0xfffffe0050561890->0xfffffe0050579057
+            dependency: com.apple.iokit.IOSCSIArchitectureModelFamily(545.100.10)[58CA76A3-BF4F-3460-A042-E8DFC13368B8]@0xfffffe0050543f60->0xfffffe005056188f
+            dependency: com.apple.iokit.IOStorageFamily(2.1)[D2FCCC47-56DD-3481-BE1C-0F2BFA2BD0E7]@0xfffffe00505f4d50->0xfffffe00506144b7
+
+** Stackshot Incomplete ** Bytes Filled 240, err 52 **
+
+Context at the time
+-------------------
+- The last lines of the daemon trace before the reboot are idle
+  TEST UNIT READY polls, every one answered GOOD; no error, no reconnect.
+- Every task in the session carried controller task identifier 64 (queue
+  depth 1), which is the kernel's choice, echoed back unchanged.
+- No panic file was written to /Library/Logs/DiagnosticReports.
+
+Why it matters regardless of cause
+----------------------------------
+DriverKit's purpose is that a userspace driver cannot corrupt kernel memory.
+Whatever this dext does or fails to do, the kernel's SCSI stack should not
+reach a use-after-free. The panic is inside
+IOSCSIArchitectureModelFamily / IOSCSIBlockCommandsDevice, not in any
+third-party kext; there are none loaded in the backtrace.
+
+Not yet established
+-------------------
+- Which object the 288-byte allocation belongs to.
+- Whether a completion from this dext (or its timing) triggers the free, or
+  whether the failing wipe path leaves the SCSI layer in a bad state.
+- Whether it reproduces. It has happened once.
