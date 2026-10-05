@@ -316,7 +316,12 @@ final class SessionPump: @unchecked Sendable {
             // kernel's task carries 0 while the remote LUN may be any value.
             let targetID = descriptor.targetID
             let responseTaskID = descriptor.taskID
-            let outCount = dataOut.count
+            // dataOut.count is NOT the payload size: the dequeue output buffer
+            // is out of line, and IOKit then reports the caller's full buffer
+            // (1 MiB) as the output length. Reporting that as bytes written
+            // made every write complete as 1 MiB, so pwrite() returned more
+            // than requested (dd "short write", wipefs err=45, -69825).
+            let outCount = min(dataOut.count, Int(descriptor.transferLength))
             try session.initiator.executeAsync(
                 lun: session.url.lun,
                 cdb: cdbData,

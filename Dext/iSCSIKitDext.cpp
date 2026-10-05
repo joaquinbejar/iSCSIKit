@@ -478,7 +478,10 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     response.fControllerTaskIdentifier = reply.taskID;
     response.fCompletionStatus = static_cast<SCSITaskStatus>(reply.status);
     response.fServiceResponse = kSCSIServiceResponse_TASK_COMPLETE;
-    response.fBytesTransferred = reply.bytesTransferred;
+    // Never report more than the kernel asked for: an over-count is passed
+    // straight up to the syscall as a byte count larger than the request.
+    response.fBytesTransferred = reply.bytesTransferred < task.fRequestedTransferCount
+        ? reply.bytesTransferred : task.fRequestedTransferCount;
     // senseLength is uint8_t, so it always fits kMaxSenseBufferSize (256).
     response.fSenseLength = reply.senseLength;
     memcpy(response.fSenseBuffer, reply.sense, reply.senseLength);
