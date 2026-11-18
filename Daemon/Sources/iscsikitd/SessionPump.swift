@@ -140,6 +140,11 @@ final class SessionPump: @unchecked Sendable {
     /// reset, so one recovery is not hidden by the next stats window.
     private var stuckRecoveries = 0
     private var stuckTimer: DispatchSourceTimer?
+    /// Task trace (dext ring + daemon events), flushed to disk with fsync.
+    private let trace = TraceLog()
+    private var traceTimer: DispatchSourceTimer?
+    private var dextEventIndex: UInt64 = 0
+    private var dextEventsLost: UInt64 = 0
     private var stats = Stats()
     private var statsTimer: DispatchSourceTimer?
     private var dext: DextClient?
@@ -239,9 +244,12 @@ final class SessionPump: @unchecked Sendable {
 
             let dext = try DextClient(queue: queue)
             self.dext = dext
-            dext.onTaskPending = { [weak self] taskID in
-                self?.handleTask(taskID)
+            dext.onTaskPending = { [weak self] taskID, seq in
+                self?.trace.daemon("Callback", seq: seq, task: taskID)
+                self?.handleTask(taskID, seq: seq)
             }
+            print("task trace: \(trace.path)")
+            trace.note("daemon started")
             try dext.registerCallback()
 
             let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -257,6 +265,16 @@ final class SessionPump: @unchecked Sendable {
             stuck.setEventHandler { [weak self] in self?.sweepStuckTasks() }
             stuck.resume()
             stuckTimer = stuck
+
+            // Drain the dext's event ring and persist both sides' events.
+            // The ring holds ISCSIKIT_EVENT_RING events (about 7 per task),
+            // so 4 Hz keeps up with several thousand tasks/s.
+            let traceTimer = DispatchSource.makeTimerSource(queue: queue)
+            traceTimer.schedule(deadline: .now() + .milliseconds(250),
+                                repeating: .milliseconds(250))
+            traceTimer.setEventHandler { [weak self] in self?.drainTrace() }
+            traceTimer.resume()
+            self.traceTimer = traceTimer
         }
 
         // Register targets OFF the pump queue: UserCreateTargetForID blocks in
@@ -276,16 +294,34 @@ final class SessionPump: @unchecked Sendable {
 
     // MARK: - Task pump (always on `queue`)
 
-    /// Dequeues one task from the dext and queues it on the session without
-    /// waiting for the answer, so up to the dext's slot count can be in
-    /// flight on the wire at once; `finish` completes it when libiscsi calls
-    /// back.
+    /// Copies every new dext trace event into the trace file, then fsyncs.
+    private func drainTrace() {
+        guard let dext else { return }
+        while true {
+            let batch: (events: [ISCSIKitEvent], next: UInt64, lost: UInt64)
+            do {
+                batch = try dext.readEvents(from: dextEventIndex)
+            } catch {
+                trace.note("ReadEvents failed: \(error)")
+                break
+            }
+            if batch.lost > 0 {
+                dextEventsLost += batch.lost
+                trace.note("dext ring overwrote \(batch.lost) events (total lost \(dextEventsLost))")
+            }
+            for event in batch.events { trace.dext(event) }
+            dextEventIndex = batch.next
+            if batch.events.count < Int(ISCSIKIT_EVENT_BATCH) { break }
+        }
+        trace.flush()
+    }
+
     /// Recovers tasks that sit in the dext's `pending` state for over 2 s.
     /// Dequeue only succeeds for pending slots, so this cannot double-run a
     /// task the notification path already took.
     private func sweepStuckTasks() {
         guard let dext else { return }
-        let stuck: [(taskID: UInt64, ageMs: UInt64)]
+        let stuck: [(taskID: UInt64, ageMs: UInt64, seq: UInt64)]
         do {
             stuck = try dext.listPending(minAgeMs: 2000)
         } catch {
@@ -294,34 +330,44 @@ final class SessionPump: @unchecked Sendable {
         }
         for entry in stuck {
             stuckRecoveries += 1
-            print(String(format: "STUCK pending task %llu age %.1fs; recovering (total recoveries %d)",
-                         entry.taskID, Double(entry.ageMs) / 1000, stuckRecoveries))
-            handleTask(entry.taskID, recovering: true)
+            print(String(format: "STUCK pending task %llu seq %llu age %.1fs; recovering (total recoveries %d)",
+                         entry.taskID, entry.seq, Double(entry.ageMs) / 1000, stuckRecoveries))
+            trace.daemon("STUCK", seq: entry.seq, task: entry.taskID,
+                         "ageMs=\(entry.ageMs) recoveries=\(stuckRecoveries)")
+            handleTask(entry.taskID, seq: entry.seq)
         }
+        if !stuck.isEmpty { trace.flush() }
     }
 
-    private func handleTask(_ taskID: UInt64, recovering: Bool = false) {
+    /// Dequeues one task from the dext and queues it on the session without
+    /// waiting for the answer, so up to the dext's slot count can be in
+    /// flight on the wire at once; `finish` completes it when libiscsi calls
+    /// back. `seq` is what the notification said; the descriptor's seq is
+    /// authoritative once dequeued.
+    private func handleTask(_ taskID: UInt64, seq notifiedSeq: UInt64) {
         guard let dext else { return }
         let dequeued: (ISCSIKitTaskDescriptor, Data)
         do {
             let t0 = Date()
             dequeued = try dext.dequeueTask(taskID)
             stats.dequeueSeconds += Date().timeIntervalSince(t0)
-        } catch where recovering {
-            // Not pending any more (or never was): nothing to recover, and
-            // failing it here could fail an in-flight task with the same id.
-            FileHandle.standardError.write(Data("STUCK task \(taskID) recovery dequeue failed: \(error)\n".utf8))
-            return
         } catch {
-            FileHandle.standardError.write(Data("task \(taskID) failed: \(error)\n".utf8))
-            try? completeFailed(taskID: taskID, targetID: 0)
+            // Never complete anything here: we hold no descriptor, and a
+            // completion by task id could fail a different in-flight task
+            // reusing that id. If the slot had gone in flight the dext has
+            // already failed that exact task (by seq).
+            trace.daemon("DequeueFailed", seq: notifiedSeq, task: taskID, "error=\"\(error)\"")
+            FileHandle.standardError.write(Data("task \(taskID) seq \(notifiedSeq) dequeue failed: \(error)\n".utf8))
             return
         }
+        let (descriptor, dataOut) = dequeued
+        let seq = descriptor.seq
+        trace.daemon("DequeueOK", seq: seq, task: taskID,
+                     "notifiedSeq=\(notifiedSeq) len=\(descriptor.transferLength) dir=\(descriptor.direction)")
         do {
-            let (descriptor, dataOut) = dequeued
             stats.tasks += 1
             guard let session = sessions[descriptor.targetID] else {
-                try completeFailed(taskID: taskID, targetID: descriptor.targetID)
+                try completeFailed(taskID: taskID, targetID: descriptor.targetID, seq: seq)
                 return
             }
 
@@ -339,7 +385,7 @@ final class SessionPump: @unchecked Sendable {
             // verified.
             if !allowWrites, !ReadOnlyPolicy.isAllowed(cdb: cdbData) {
                 try completeWriteProtected(taskID: descriptor.taskID,
-                                           targetID: descriptor.targetID)
+                                           targetID: descriptor.targetID, seq: seq)
                 print("task \(taskID): cdb 0x\(String(format: "%02x", descriptor.cdb.0)) REJECTED (read-only)")
                 return
             }
@@ -374,25 +420,28 @@ final class SessionPump: @unchecked Sendable {
                 transferLength: descriptor.transferLength,
                 dataOut: direction == .write ? dataOut.prefix(Int(descriptor.transferLength)) : nil
             ) { [weak self] outcome in
-                self?.finish(taskID: responseTaskID, targetID: targetID, direction: direction,
-                             bytesOut: outCount, outcome: outcome)
+                self?.finish(taskID: responseTaskID, seq: seq, targetID: targetID,
+                             direction: direction, bytesOut: outCount, outcome: outcome)
             }
             // libiscsi now has output pending; make sure POLLOUT is watched.
             session.loop.update()
             stats.maxInFlight = max(stats.maxInFlight, session.initiator.inFlight)
         } catch {
             FileHandle.standardError.write(Data("task \(taskID) failed: \(error)\n".utf8))
-            try? completeFailed(taskID: taskID, targetID: 0)
+            try? completeFailed(taskID: taskID, targetID: descriptor.targetID, seq: seq)
         }
     }
 
     /// Completion for a queued command; runs on `queue` from the session's
     /// socket service.
-    private func finish(taskID: UInt64, targetID: UInt64, direction: Initiator.TransferDirection,
+    private func finish(taskID: UInt64, seq: UInt64, targetID: UInt64,
+                        direction: Initiator.TransferDirection,
                         bytesOut: Int, outcome: Result<Initiator.RawResult, Error>) {
         guard let dext else { return }
         switch outcome {
         case .success(let result):
+            trace.daemon("Response", seq: seq, task: taskID,
+                         "status=0x\(String(result.status, radix: 16)) residual=\(result.residual) dataIn=\(result.dataIn.count)")
             if traceTasks, result.status != 0 {
                 print("task \(taskID) <- status 0x\(String(format: "%02x", result.status)) sense \(result.sense.map { String(format: "%02x", $0) }.joined())")
             } else if traceTasks {
@@ -412,19 +461,17 @@ final class SessionPump: @unchecked Sendable {
                 result.sense.copyBytes(to: senseBuffer, count: count)
                 response.senseLength = UInt8(count)
             }
-            do {
-                let t0 = Date()
-                try dext.completeTask(response, dataIn: result.dataIn)
+            let t0 = Date()
+            if (try? sendCompletion(response, dataIn: result.dataIn, seq: seq)) != nil {
                 stats.completeSeconds += Date().timeIntervalSince(t0)
-            } catch {
-                FileHandle.standardError.write(Data("task \(taskID) complete failed: \(error)\n".utf8))
             }
         case .failure(let error):
             // A transport failure (cancelled, timed out, connection lost) is
             // reported to the kernel as a failed task, which it retries; the
             // session itself is reconnected once, not once per task.
             FileHandle.standardError.write(Data("task \(taskID) transport error: \(error)\n".utf8))
-            try? completeFailed(taskID: taskID, targetID: targetID)
+            trace.daemon("TransportError", seq: seq, task: taskID, "error=\"\(error)\"")
+            try? completeFailed(taskID: taskID, targetID: targetID, seq: seq)
             if let session = sessions[targetID] {
                 reconnect(session, targetID: targetID, reason: "\(error)")
             }
@@ -459,19 +506,34 @@ final class SessionPump: @unchecked Sendable {
         stats = Stats()
     }
 
-    private func completeFailed(taskID: UInt64, targetID: UInt64) throws {
+    /// completeTask plus its return code in the trace.
+    private func sendCompletion(_ response: ISCSIKitTaskResponse, dataIn: Data, seq: UInt64) throws {
         guard let dext else { return }
+        do {
+            try dext.completeTask(response, dataIn: dataIn)
+            trace.daemon("CompleteRC", seq: seq, task: response.taskID,
+                         "rc=0x0 status=0x\(String(response.status, radix: 16)) bytes=\(response.bytesTransferred)")
+        } catch {
+            var rc: kern_return_t = KERN_FAILURE
+            if case DextClientError.ioKit(_, let code) = error { rc = code }
+            trace.daemon("CompleteRC", seq: seq, task: response.taskID,
+                         "rc=0x\(String(UInt32(bitPattern: rc), radix: 16))")
+            FileHandle.standardError.write(Data("task \(response.taskID) seq \(seq) complete failed: \(error)\n".utf8))
+            throw error
+        }
+    }
+
+    private func completeFailed(taskID: UInt64, targetID: UInt64, seq: UInt64) throws {
         var response = ISCSIKitTaskResponse()
         response.taskID = taskID
         response.targetID = targetID
         response.status = 0x02  // CHECK CONDITION
-        try dext.completeTask(response, dataIn: Data())
+        try sendCompletion(response, dataIn: Data(), seq: seq)
     }
 
     /// Completes a task with DATA PROTECT / WRITE PROTECTED sense so the OS
     /// treats the write as rejected by a read-only medium.
-    private func completeWriteProtected(taskID: UInt64, targetID: UInt64) throws {
-        guard let dext else { return }
+    private func completeWriteProtected(taskID: UInt64, targetID: UInt64, seq: UInt64) throws {
         var response = ISCSIKitTaskResponse()
         response.taskID = taskID
         response.targetID = targetID
@@ -482,7 +544,7 @@ final class SessionPump: @unchecked Sendable {
             sense.withUnsafeBytes { buffer.copyMemory(from: UnsafeRawBufferPointer(rebasing: $0.prefix(count))) }
             response.senseLength = UInt8(count)
         }
-        try dext.completeTask(response, dataIn: Data())
+        try sendCompletion(response, dataIn: Data(), seq: seq)
     }
 
     // MARK: - Sleep / wake
@@ -525,6 +587,7 @@ final class SessionPump: @unchecked Sendable {
         let sigint = DispatchSource.makeSignalSource(signal: SIGINT, queue: queue)
         sigint.setEventHandler { [self] in
             print("\nshutting down")
+            drainTrace()
             for targetID in sessions.keys.sorted().reversed() {
                 try? dext?.unregisterTarget(targetID)
                 sessions[targetID]?.loop.stop()

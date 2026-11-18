@@ -23,7 +23,7 @@ final class DextClient {
     private var connection: io_connect_t = 0
     private var notifyPort: IONotificationPortRef?
     private let queue: DispatchQueue
-    var onTaskPending: ((UInt64) -> Void)?
+    var onTaskPending: ((_ taskID: UInt64, _ seq: UInt64) -> Void)?
 
     init(queue: DispatchQueue) throws {
         self.queue = queue
@@ -52,12 +52,13 @@ final class DextClient {
 
         // IODispatchCalloutFromMessage invokes the callout with the async
         // arguments unpacked: (refcon, result, arg0, arg1, …), not as an
-        // array. One argument here: arg0 is the controller task id.
-        let callback: IOAsyncCallback1 = { refcon, result, arg0 in
+        // array. arg0 is the controller task id, arg1 the dext's seq.
+        let callback: IOAsyncCallback2 = { refcon, result, arg0, arg1 in
             guard result == KERN_SUCCESS, let refcon else { return }
             let client = Unmanaged<DextClient>.fromOpaque(refcon).takeUnretainedValue()
             let taskID = UInt64(UInt(bitPattern: arg0))
-            client.onTaskPending?(taskID)
+            let seq = UInt64(UInt(bitPattern: arg1))
+            client.onTaskPending?(taskID, seq)
         }
 
         var asyncRef = [UInt64](repeating: 0, count: Int(kIOAsyncCalloutCount))
@@ -125,10 +126,10 @@ final class DextClient {
 
     /// Tasks queued in the dext but never dequeued for at least `minAgeMs`:
     /// their "task pending" notification never reached us.
-    func listPending(minAgeMs: UInt64) throws -> [(taskID: UInt64, ageMs: UInt64)] {
+    func listPending(minAgeMs: UInt64) throws -> [(taskID: UInt64, ageMs: UInt64, seq: UInt64)] {
         var input = [minAgeMs]
         // Mirrors ISCSIKIT_LIST_PENDING_BYTES (a computed macro Swift cannot import).
-        let words = 1 + 2 * Int(ISCSIKIT_MAX_TASKS)
+        let words = 1 + 3 * Int(ISCSIKIT_MAX_TASKS)
         var buffer = [UInt64](repeating: 0, count: words)
         var length = words * MemoryLayout<UInt64>.size
         let ret = IOConnectCallMethod(
@@ -140,13 +141,46 @@ final class DextClient {
         )
         guard ret == KERN_SUCCESS else { throw DextClientError.ioKit("ListPending", ret) }
         let count = min(Int(buffer[0]), Int(ISCSIKIT_MAX_TASKS))
-        var result: [(taskID: UInt64, ageMs: UInt64)] = []
+        var result: [(taskID: UInt64, ageMs: UInt64, seq: UInt64)] = []
         for index in 0..<count {
-            let taskID: UInt64 = buffer[1 + 2 * index]
-            let ageMs: UInt64 = buffer[2 + 2 * index]
-            result.append((taskID: taskID, ageMs: ageMs))
+            let taskID: UInt64 = buffer[1 + 3 * index]
+            let ageMs: UInt64 = buffer[2 + 3 * index]
+            let seq: UInt64 = buffer[3 + 3 * index]
+            result.append((taskID: taskID, ageMs: ageMs, seq: seq))
         }
         return result
+    }
+
+    /// Reads up to ISCSIKIT_EVENT_BATCH trace events starting at `index`.
+    /// `lost` counts events the ring overwrote before they were read.
+    func readEvents(from index: UInt64) throws
+        -> (events: [ISCSIKitEvent], next: UInt64, lost: UInt64) {
+        var input = [index]
+        let headerSize = MemoryLayout<ISCSIKitEventBatchHeader>.size
+        let eventSize = MemoryLayout<ISCSIKitEvent>.stride
+        let capacity = headerSize + eventSize * Int(ISCSIKIT_EVENT_BATCH)
+        var buffer = [UInt8](repeating: 0, count: capacity)
+        var length = capacity
+        let ret = IOConnectCallMethod(
+            connection, UInt32(kISCSIKitMethodReadEvents.rawValue),
+            &input, 1,
+            nil, 0,
+            nil, nil,
+            &buffer, &length
+        )
+        guard ret == KERN_SUCCESS else { throw DextClientError.ioKit("ReadEvents", ret) }
+        return buffer.withUnsafeBytes { raw in
+            let header = raw.loadUnaligned(as: ISCSIKitEventBatchHeader.self)
+            let count = min(Int(header.count), Int(ISCSIKIT_EVENT_BATCH))
+            var events: [ISCSIKitEvent] = []
+            events.reserveCapacity(count)
+            for i in 0..<count {
+                events.append(raw.loadUnaligned(fromByteOffset: headerSize + i * eventSize,
+                                                as: ISCSIKitEvent.self))
+            }
+            let lost = header.firstIndex > index ? header.firstIndex - index : 0
+            return (events, header.nextIndex, lost)
+        }
     }
 
     func completeTask(_ response: ISCSIKitTaskResponse, dataIn: Data) throws {

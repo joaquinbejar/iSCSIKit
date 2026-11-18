@@ -65,8 +65,10 @@ struct TaskSlot {
     // documented way to reach an IOMemoryDescriptor's bytes; GetAddressRange
     // is LOCALONLY and only meaningful for a descriptor the dext created.
     IOMemoryMap * map;
-    // Diagnostics: when the slot entered `pending` (CLOCK_UPTIME_RAW ns).
+    // Diagnostics: when the slot entered `pending` (CLOCK_UPTIME_RAW ns),
+    // and the dext sequence number of the task it holds.
     uint64_t queuedAtNs;
+    uint64_t seq;
 };
 
 static uint64_t nowNs()
@@ -105,7 +107,42 @@ struct iSCSIKitDext_IVars {
     // and on every ListPending call from the daemon (1 Hz).
     uint64_t statReceived, statNotified, statNotifyFailed, statDequeued;
     uint64_t statCompleted, statMaxPending, statListPendingReported;
+    // Event trace (see ISCSIKitEventType). Ring of ISCSIKIT_EVENT_RING
+    // entries; ringNext counts every event ever written, so the reader can
+    // tell how many it lost. Guarded by `lock`.
+    ISCSIKitEvent * ring;
+    uint64_t ringNext;
+    uint64_t nextSeq;
 };
+
+// Appends one trace event. Caller holds v->lock.
+static void recordEventLocked(iSCSIKitDext_IVars * v, uint8_t type, uint64_t seq,
+                              uint64_t taskID, uint32_t code, uint64_t value,
+                              uint8_t extra = 0)
+{
+    if (!v->ring) {
+        return;
+    }
+    ISCSIKitEvent & e = v->ring[v->ringNext % ISCSIKIT_EVENT_RING];
+    e.seq = seq;
+    e.timeNs = nowNs();
+    e.taskID = taskID;
+    e.value = value;
+    e.code = code;
+    e.type = type;
+    e.extra = extra;
+    e.reserved[0] = e.reserved[1] = 0;
+    v->ringNext++;
+}
+
+static void recordEvent(iSCSIKitDext_IVars * v, uint8_t type, uint64_t seq,
+                        uint64_t taskID, uint32_t code, uint64_t value,
+                        uint8_t extra = 0)
+{
+    IOLockLock(v->lock);
+    recordEventLocked(v, type, seq, taskID, code, value, extra);
+    IOLockUnlock(v->lock);
+}
 
 // Publishes the task lifecycle counters. Takes the lock only to snapshot;
 // SetProperties (a blocking RPC) runs outside it.
@@ -236,6 +273,8 @@ bool iSCSIKitDext::init()
     if (!ivars->lock) {
         return false;
     }
+    ivars->ring = reinterpret_cast<ISCSIKitEvent *>(
+        IOMallocZero(sizeof(ISCSIKitEvent) * ISCSIKIT_EVENT_RING));
     LOG("init");
     return true;
 }
@@ -246,6 +285,10 @@ void iSCSIKitDext::free()
         OSSafeReleaseNULL(ivars->targetOpsQueue);
         if (ivars->lock) {
             IOLockFree(ivars->lock);
+        }
+        if (ivars->ring) {
+            IOFree(ivars->ring, sizeof(ISCSIKitEvent) * ISCSIKIT_EVENT_RING);
+            ivars->ring = nullptr;
         }
         IOSafeDeleteNULL(ivars, iSCSIKitDext_IVars, 1);
     }
@@ -317,6 +360,7 @@ bool iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
     // RPCs must never run while holding the slot lock.
     OSAction * completions[kMaxTaskCount] = {};
     SCSIUserParallelResponse responses[kMaxTaskCount] = {};
+    uint64_t seqs[kMaxTaskCount] = {};
     uint32_t failCount = 0;
 
     IOLockLock(ivars->lock);
@@ -340,6 +384,10 @@ bool iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
                 response.fServiceResponse = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
                 completions[failCount] = slot.completion;
                 responses[failCount] = response;
+                seqs[failCount] = slot.seq;
+                recordEventLocked(ivars, kISCSIKitEvDisconnectFailed, slot.seq,
+                                  slot.task.fControllerTaskIdentifier,
+                                  static_cast<uint32_t>(slot.state), 0);
                 failCount++;
                 slot.completion = nullptr;
                 OSSafeReleaseNULL(slot.map);
@@ -360,6 +408,9 @@ bool iSCSIKitDext::DaemonSetUserClient(iSCSIKitUserClient * client)
 
     for (uint32_t i = 0; i < failCount; i++) {
         ParallelTaskCompletion(completions[i], responses[i]);
+        recordEvent(ivars, kISCSIKitEvCompleted, seqs[i],
+                    responses[i].fControllerTaskIdentifier,
+                    responses[i].fCompletionStatus, 0, responses[i].fServiceResponse);
         OSSafeReleaseNULL(completions[i]);
     }
     return true;
@@ -412,8 +463,70 @@ kern_return_t iSCSIKitDext::DaemonUnregisterTarget(uint64_t targetID)
     return kIOReturnSuccess;
 }
 
-kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
-                                              IOUserClientMethodArguments * arguments)
+// Fails a task the daemon dequeued but could not be handed its descriptor:
+// frees the slot and completes the task to the kernel with an error, so a
+// failed dequeue never leaves the slot in flight forever. Matches by seq,
+// never by task id, so it cannot touch a different task reusing the id.
+static void failDequeuedTask(iSCSIKitDext * dext, iSCSIKitDext_IVars * v,
+                             uint64_t seq, kern_return_t why)
+{
+    IOLockLock(v->lock);
+    TaskSlot * found = nullptr;
+    for (auto & slot : v->slots) {
+        if (slot.state == SlotState::inFlight && slot.seq == seq) {
+            found = &slot;
+            break;
+        }
+    }
+    if (!found) {
+        IOLockUnlock(v->lock);
+        return;
+    }
+    uint64_t taskID = found->task.fControllerTaskIdentifier;
+    uint64_t targetID = found->task.fTargetID;
+    OSAction * completion = found->completion;
+    IOBufferMemoryDescriptor * buffer = found->buffer;
+    IOMemoryMap * map = found->map;
+    if (found->staged) {
+        IOFree(found->staged, found->stagedLength);
+    }
+    found->staged = nullptr;
+    found->stagedLength = 0;
+    found->completion = nullptr;
+    found->buffer = nullptr;
+    found->map = nullptr;
+    found->bufferAddress = 0;
+    found->bufferLength = 0;
+    found->bufferIOVA = 0;
+    found->state = SlotState::free_;
+    if (taskID >= 1 && taskID <= 64) {
+        v->activeTaskIDs &= ~(1ULL << (taskID - 1));
+    }
+    recordEventLocked(v, kISCSIKitEvDequeueFailed, seq, taskID, static_cast<uint32_t>(why), 0);
+    IOLockUnlock(v->lock);
+    LOG("task %llu seq %llu: dequeue failed 0x%x; failing the task", taskID, seq, why);
+
+    OSSafeReleaseNULL(map);
+    OSSafeReleaseNULL(buffer);
+    SCSIUserParallelResponse response = {};
+    response.version = kScsiUserParallelTaskResponseCurrentVersion1;
+    response.fTargetID = targetID;
+    response.fControllerTaskIdentifier = taskID;
+    response.fCompletionStatus = kSCSITaskStatus_No_Status;
+    response.fServiceResponse = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+    if (completion) {
+        dext->ParallelTaskCompletion(completion, response);
+        recordEvent(v, kISCSIKitEvCompleted, seq, taskID, response.fCompletionStatus, 0,
+                    response.fServiceResponse);
+        OSSafeReleaseNULL(completion);
+    }
+}
+
+// Hands one pending task to the daemon. On failure after the slot went
+// in flight, *seqOut is set so the caller can fail that exact task.
+static kern_return_t dequeueTaskImpl(iSCSIKitDext_IVars * ivars, uint64_t taskID,
+                                          IOUserClientMethodArguments * arguments,
+                                          uint64_t * seqOut)
 {
     IOLockLock(ivars->lock);
     TaskSlot * found = nullptr;
@@ -425,12 +538,20 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
         }
     }
     if (!found) {
+        recordEventLocked(ivars, kISCSIKitEvDequeueNotFound, 0, taskID, kIOReturnNotFound, 0);
         IOLockUnlock(ivars->lock);
         return kIOReturnNotFound;
     }
     found->state = SlotState::inFlight;
     ivars->statDequeued++;
     SCSIUserParallelTask task = found->task;
+    uint64_t seq = found->seq;
+    *seqOut = seq;
+    uint16_t firstNonzeroOffset = found->firstNonzeroOffset;
+    // The slot is in flight: only this call, completion (which needs the
+    // daemon to hold the descriptor) or a disconnect touch it now.
+    const uint8_t * staged = found->staged;
+    uint64_t stagedLength = found->stagedLength;
     IOLockUnlock(ivars->lock);
 
     ISCSIKitTaskDescriptor descriptor = {};
@@ -442,7 +563,8 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
     descriptor.direction = task.fTransferDirection;
     descriptor.cdbLength = task.fCommandSize;
     memcpy(descriptor.cdb, task.fCommandDescriptorBlock, sizeof(descriptor.cdb));
-    memcpy(descriptor.reserved, &found->firstNonzeroOffset, sizeof(uint16_t));
+    memcpy(descriptor.reserved, &firstNonzeroOffset, sizeof(uint16_t));
+    descriptor.seq = seq;
 
     uint64_t payloadLength = 0;
     if (task.fTransferDirection == kISCSIKitWrite) {
@@ -458,12 +580,12 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
 
     if (payloadLength > 0) {
         // A write must reach the daemon whole or not at all. Failing here
-        // leaves the slot in flight; the daemon then completes it as failed.
-        if (found->staged == nullptr || found->stagedLength < payloadLength) {
+        // fails the task in DaemonDequeueTask.
+        if (staged == nullptr || stagedLength < payloadLength) {
             IOFree(bytes, totalLength);
             return kIOReturnUnderrun;
         }
-        memcpy(bytes + sizeof(descriptor), found->staged, payloadLength);
+        memcpy(bytes + sizeof(descriptor), staged, payloadLength);
     }
 
     // Large outputs arrive as an IOMemoryDescriptor to fill; small ones as
@@ -485,21 +607,39 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
         memcpy(reinterpret_cast<void *>(map->GetAddress()), bytes, totalLength);
         map->release();
         IOFree(bytes, totalLength);
+        recordEvent(ivars, kISCSIKitEvDequeueOK, seq, taskID, 0, totalLength);
         return kIOReturnSuccess;
     }
     arguments->structureOutput = OSData::withBytes(bytes, totalLength);
     IOFree(bytes, totalLength);
-    return arguments->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
+    if (!arguments->structureOutput) {
+        return kIOReturnNoMemory;
+    }
+    recordEvent(ivars, kISCSIKitEvDequeueOK, seq, taskID, 0, totalLength);
+    return kIOReturnSuccess;
+}
+
+kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
+                                              IOUserClientMethodArguments * arguments)
+{
+    uint64_t seq = 0;
+    kern_return_t ret = dequeueTaskImpl(ivars, taskID, arguments, &seq);
+    if (ret != kIOReturnSuccess && seq != 0) {
+        // The slot already went in flight: complete the task with an error
+        // here, or nothing ever would (the daemon has no descriptor).
+        failDequeuedTask(this, ivars, seq, ret);
+    }
+    return ret;
 }
 
 kern_return_t iSCSIKitDext::DaemonListPending(uint64_t minAgeMs,
                                               IOUserClientMethodArguments * arguments)
 {
-    // Pairs of (taskID, ageMs) for every slot still `pending` (queued, never
+    // Triples of (taskID, ageMs, seq) for every slot still `pending` (queued, never
     // dequeued) for at least minAgeMs: a task whose notification was lost.
     // entries[0] = count, then count pairs. Fixed size, so the output is
     // never empty (an empty OSData is not guaranteed to be creatable).
-    uint64_t entries[1 + 2 * kMaxTaskCount] = {};
+    uint64_t entries[1 + 3 * kMaxTaskCount] = {};
     uint32_t count = 0;
     uint64_t now = nowNs();
     IOLockLock(ivars->lock);
@@ -509,8 +649,9 @@ kern_return_t iSCSIKitDext::DaemonListPending(uint64_t minAgeMs,
         }
         uint64_t ageMs = now > slot.queuedAtNs ? (now - slot.queuedAtNs) / 1000000 : 0;
         if (ageMs >= minAgeMs) {
-            entries[1 + 2 * count] = slot.task.fControllerTaskIdentifier;
-            entries[2 + 2 * count] = ageMs;
+            entries[1 + 3 * count] = slot.task.fControllerTaskIdentifier;
+            entries[2 + 3 * count] = ageMs;
+            entries[3 + 3 * count] = slot.seq;
             count++;
         }
     }
@@ -544,6 +685,64 @@ kern_return_t iSCSIKitDext::DaemonListPending(uint64_t minAgeMs,
     return arguments->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
+kern_return_t iSCSIKitDext::DaemonReadEvents(uint64_t startIndex,
+                                             IOUserClientMethodArguments * arguments)
+{
+    if (!ivars->ring) {
+        return kIOReturnNoMemory;
+    }
+    const uint64_t maxBytes = sizeof(ISCSIKitEventBatchHeader) +
+        sizeof(ISCSIKitEvent) * ISCSIKIT_EVENT_BATCH;
+    uint8_t * out = reinterpret_cast<uint8_t *>(IOMallocZero(maxBytes));
+    if (!out) {
+        return kIOReturnNoMemory;
+    }
+    ISCSIKitEventBatchHeader header = {};
+    ISCSIKitEvent * events = reinterpret_cast<ISCSIKitEvent *>(out + sizeof(header));
+    IOLockLock(ivars->lock);
+    uint64_t oldest = ivars->ringNext > ISCSIKIT_EVENT_RING
+        ? ivars->ringNext - ISCSIKIT_EVENT_RING : 0;
+    uint64_t first = startIndex < oldest ? oldest : startIndex;
+    if (first > ivars->ringNext) {
+        first = ivars->ringNext;  // reader ahead (dext restarted): resync
+    }
+    uint64_t count = ivars->ringNext - first;
+    if (count > ISCSIKIT_EVENT_BATCH) {
+        count = ISCSIKIT_EVENT_BATCH;
+    }
+    for (uint64_t i = 0; i < count; i++) {
+        events[i] = ivars->ring[(first + i) % ISCSIKIT_EVENT_RING];
+    }
+    IOLockUnlock(ivars->lock);
+    header.firstIndex = first;
+    header.count = count;
+    header.nextIndex = first + count;
+    memcpy(out, &header, sizeof(header));
+
+    // Fixed size output (the daemon passes a buffer of maxBytes); unused
+    // tail is zero.
+    kern_return_t ret = kIOReturnSuccess;
+    if (arguments->structureOutputDescriptor) {
+        IOMemoryMap * map = nullptr;
+        ret = arguments->structureOutputDescriptor->CreateMapping(0, 0, 0, 0, 0, &map);
+        if (ret == kIOReturnSuccess && map) {
+            if (map->GetLength() >= maxBytes) {
+                memcpy(reinterpret_cast<void *>(map->GetAddress()), out, maxBytes);
+            } else {
+                ret = kIOReturnNoSpace;
+            }
+            map->release();
+        } else if (ret == kIOReturnSuccess) {
+            ret = kIOReturnNoMemory;
+        }
+    } else {
+        arguments->structureOutput = OSData::withBytes(out, maxBytes);
+        ret = arguments->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
+    }
+    IOFree(out, maxBytes);
+    return ret;
+}
+
 kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t length)
 {
     if (length < sizeof(ISCSIKitTaskResponse)) {
@@ -562,9 +761,14 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
         }
     }
     if (!found) {
+        recordEventLocked(ivars, kISCSIKitEvResponseNotFound, 0, reply.taskID, reply.status,
+                          reply.bytesTransferred);
         IOLockUnlock(ivars->lock);
         return kIOReturnNotFound;
     }
+    uint64_t seq = found->seq;
+    recordEventLocked(ivars, kISCSIKitEvResponse, seq, reply.taskID, reply.status,
+                      reply.bytesTransferred);
     SCSIUserParallelTask task = found->task;
     OSAction * completion = found->completion;
     IOBufferMemoryDescriptor * buffer = found->buffer;
@@ -645,6 +849,8 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     memcpy(response.fSenseBuffer, reply.sense, reply.senseLength);
 
     ParallelTaskCompletion(completion, response);
+    recordEvent(ivars, kISCSIKitEvCompleted, seq, reply.taskID, response.fCompletionStatus,
+                response.fBytesTransferred, response.fServiceResponse);
     OSSafeReleaseNULL(completion);
     return kIOReturnSuccess;
 }
@@ -819,6 +1025,13 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
 {
     // Fetch the data buffer here: UserGetDataBuffer is only legal inside
     // UserProcessParallelTask. The slot keeps it until completion.
+    const uint64_t taskID = parallelRequest.fControllerTaskIdentifier;
+    IOLockLock(ivars->lock);
+    const uint64_t seq = ++ivars->nextSeq;
+    recordEventLocked(ivars, kISCSIKitEvReceived, seq, taskID,
+                      parallelRequest.fTransferDirection,
+                      parallelRequest.fRequestedTransferCount);
+    IOLockUnlock(ivars->lock);
     IOBufferMemoryDescriptor * buffer = nullptr;
     IOAddressSegment range = {};
     IOMemoryMap * map = nullptr;
@@ -834,6 +1047,8 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
                 parallelRequest.fControllerTaskIdentifier, ret,
                 parallelRequest.fTransferDirection,
                 parallelRequest.fRequestedTransferCount);
+            recordEvent(ivars, kISCSIKitEvBufferFailed, seq, taskID,
+                        static_cast<uint32_t>(ret != kIOReturnSuccess ? ret : kIOReturnNoMemory), 0);
             *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
             return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
         }
@@ -855,7 +1070,9 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
 
     IOLockLock(ivars->lock);
     if (!ivars->userClient) {
+        recordEventLocked(ivars, kISCSIKitEvNoClient, seq, taskID, kIOReturnNotReady, 0);
         IOLockUnlock(ivars->lock);
+        OSSafeReleaseNULL(map);
         OSSafeReleaseNULL(buffer);
         *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
         return kIOReturnNotReady;
@@ -868,13 +1085,16 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
         }
     }
     if (!slot) {
+        recordEventLocked(ivars, kISCSIKitEvNoSlot, seq, taskID, kIOReturnNoResources, 0);
         IOLockUnlock(ivars->lock);
+        OSSafeReleaseNULL(map);
         OSSafeReleaseNULL(buffer);
         *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
         return kIOReturnNoResources;
     }
     slot->state = SlotState::pending;
     slot->queuedAtNs = nowNs();
+    slot->seq = seq;
     slot->task = parallelRequest;
     completion->retain();
     slot->completion = completion;
@@ -985,6 +1205,8 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
             OSSafeReleaseNULL(completion);
             ivars->activeTaskIDs &= ~taskBit;
             slot->map = nullptr;
+            slot->buffer = nullptr;
+            recordEventLocked(ivars, kISCSIKitEvBufferFailed, seq, taskID, kIOReturnNoMemory, 0);
             IOLockUnlock(ivars->lock);
             OSSafeReleaseNULL(map);
             OSSafeReleaseNULL(buffer);
@@ -998,6 +1220,8 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
             OSSafeReleaseNULL(completion);
             ivars->activeTaskIDs &= ~taskBit;
             slot->map = nullptr;
+            slot->buffer = nullptr;
+            recordEventLocked(ivars, kISCSIKitEvBufferFailed, seq, taskID, kIOReturnNoMemory, 0);
             IOLockUnlock(ivars->lock);
             OSSafeReleaseNULL(map);
             OSSafeReleaseNULL(buffer);
@@ -1023,6 +1247,7 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
         ivars->statMaxPending = pendingNow;
     }
     bool publishStats = (++ivars->statReceived % 32) == 0;
+    recordEventLocked(ivars, kISCSIKitEvSlotReserved, seq, taskID, 0, pendingNow);
     bool isWrite = parallelRequest.fTransferDirection == kISCSIKitWrite &&
                    parallelRequest.fRequestedTransferCount > 0;
     IOLockUnlock(ivars->lock);
@@ -1030,17 +1255,50 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     if (isWrite) {
         publishWriteProbe(this, ivars);
     }
-    bool notified = client->NotifyTaskPending(parallelRequest.fControllerTaskIdentifier);
+    bool notified = client->NotifyTaskPending(taskID, seq);
+    // Fail the task here when no notification went out: otherwise it sits
+    // pending until something else notices it.
+    OSAction * orphanCompletion = nullptr;
+    IOBufferMemoryDescriptor * orphanBuffer = nullptr;
+    IOMemoryMap * orphanMap = nullptr;
     IOLockLock(ivars->lock);
     if (notified) {
         ivars->statNotified++;
+        recordEventLocked(ivars, kISCSIKitEvNotifyOK, seq, taskID, 0, 0);
     } else {
         ivars->statNotifyFailed++;
         publishStats = true;
+        recordEventLocked(ivars, kISCSIKitEvNotifyNoCallback, seq, taskID, kIOReturnNotReady, 0);
+        // Only if still pending: the stuck sweep may have dequeued it.
+        if (slot->state == SlotState::pending && slot->seq == seq) {
+            orphanCompletion = slot->completion;
+            orphanBuffer = slot->buffer;
+            orphanMap = slot->map;
+            if (slot->staged) {
+                IOFree(slot->staged, slot->stagedLength);
+            }
+            slot->staged = nullptr;
+            slot->stagedLength = 0;
+            slot->completion = nullptr;
+            slot->buffer = nullptr;
+            slot->map = nullptr;
+            slot->bufferAddress = 0;
+            slot->bufferLength = 0;
+            slot->bufferIOVA = 0;
+            slot->state = SlotState::free_;
+            ivars->activeTaskIDs &= ~taskBit;
+        }
     }
     IOLockUnlock(ivars->lock);
     if (publishStats) {
         publishTaskStats(this, ivars);
+    }
+    if (!notified && orphanCompletion) {
+        OSSafeReleaseNULL(orphanMap);
+        OSSafeReleaseNULL(orphanBuffer);
+        OSSafeReleaseNULL(orphanCompletion);
+        *response = kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE;
+        return kIOReturnNotReady;
     }
     *response = kSCSIServiceResponse_Request_In_Process;
     return kIOReturnSuccess;
