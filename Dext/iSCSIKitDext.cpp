@@ -15,6 +15,7 @@
 #include <DriverKit/IOBufferMemoryDescriptor.h>
 #include <DriverKit/IOMemoryMap.h>
 #include <DriverKit/IOUserClient.h>
+#include <time.h>
 #include <SCSIControllerDriverKit/IOSCSIParallelControllerCharacteristics.h>
 #include "iSCSIKitDext.h"
 #include "iSCSIKitUserClient.h"
@@ -23,6 +24,7 @@
 #define LOG(fmt, ...) os_log(OS_LOG_DEFAULT, "iSCSIKitDext: " fmt, ##__VA_ARGS__)
 
 static constexpr uint32_t kMaxTaskCount = 64;
+static_assert(kMaxTaskCount == ISCSIKIT_MAX_TASKS, "protocol header out of sync");
 // Max bytes per task. Kept in lockstep with the daemon's dequeue/complete
 // buffers (ISCSIKIT_MAX_TRANSFER) so a single struct round trip always fits.
 // A larger transfer amortizes the fixed per-task dext<->daemon IPC cost over
@@ -63,7 +65,14 @@ struct TaskSlot {
     // documented way to reach an IOMemoryDescriptor's bytes; GetAddressRange
     // is LOCALONLY and only meaningful for a descriptor the dext created.
     IOMemoryMap * map;
+    // Diagnostics: when the slot entered `pending` (CLOCK_UPTIME_RAW ns).
+    uint64_t queuedAtNs;
 };
+
+static uint64_t nowNs()
+{
+    return clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
+}
 
 }  // namespace
 
@@ -91,7 +100,70 @@ struct iSCSIKitDext_IVars {
     uint64_t logOpcode[kProbeLog], logLBA[kProbeLog], logLength[kProbeLog];
     uint64_t logRangeNZ[kProbeLog], logMapNZ[kProbeLog], logDiff[kProbeLog];
     uint32_t logIndex, logCount;
+    // Task lifecycle counters (lost-notification diagnostics), published to
+    // the IORegistry as TaskStats_* every 32 received / 32 completed tasks
+    // and on every ListPending call from the daemon (1 Hz).
+    uint64_t statReceived, statNotified, statNotifyFailed, statDequeued;
+    uint64_t statCompleted, statMaxPending, statListPendingReported;
 };
+
+// Publishes the task lifecycle counters. Takes the lock only to snapshot;
+// SetProperties (a blocking RPC) runs outside it.
+static void publishTaskStats(iSCSIKitDext * dext, iSCSIKitDext_IVars * v)
+{
+    uint64_t received, notified, notifyFailed, dequeued, completed, maxPending;
+    uint64_t listReported, pending = 0, inFlight = 0, oldestID = 0, oldestAgeMs = 0;
+    uint64_t now = nowNs();
+    IOLockLock(v->lock);
+    received = v->statReceived;
+    notified = v->statNotified;
+    notifyFailed = v->statNotifyFailed;
+    dequeued = v->statDequeued;
+    completed = v->statCompleted;
+    maxPending = v->statMaxPending;
+    listReported = v->statListPendingReported;
+    uint64_t oldestAt = UINT64_MAX;
+    for (auto & slot : v->slots) {
+        if (slot.state == SlotState::pending) {
+            pending++;
+            if (slot.queuedAtNs < oldestAt) {
+                oldestAt = slot.queuedAtNs;
+                oldestID = slot.task.fControllerTaskIdentifier;
+            }
+        } else if (slot.state == SlotState::inFlight) {
+            inFlight++;
+        }
+    }
+    IOLockUnlock(v->lock);
+    if (pending > 0 && now > oldestAt) {
+        oldestAgeMs = (now - oldestAt) / 1000000;
+    }
+
+    OSDictionary * d = OSDictionary::withCapacity(12);
+    if (!d) {
+        return;
+    }
+    auto set = [&](const char * key, uint64_t value) {
+        OSNumber * n = OSNumber::withNumber(value, 64);
+        if (n) {
+            d->setObject(key, n);
+            n->release();
+        }
+    };
+    set("TaskStats_Received", received);
+    set("TaskStats_Notified", notified);
+    set("TaskStats_NotifyFailed", notifyFailed);
+    set("TaskStats_Dequeued", dequeued);
+    set("TaskStats_Completed", completed);
+    set("TaskStats_CurrentPending", pending);
+    set("TaskStats_CurrentInFlight", inFlight);
+    set("TaskStats_MaxPending", maxPending);
+    set("TaskStats_OldestPendingTaskID", oldestID);
+    set("TaskStats_OldestPendingAgeMs", oldestAgeMs);
+    set("TaskStats_StalePendingReported", listReported);
+    dext->SetProperties(d);
+    d->release();
+}
 
 // Publishes the write probe. Only called for write tasks (a blocking RPC, so
 // never on the read hot path).
@@ -357,6 +429,7 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
         return kIOReturnNotFound;
     }
     found->state = SlotState::inFlight;
+    ivars->statDequeued++;
     SCSIUserParallelTask task = found->task;
     IOLockUnlock(ivars->lock);
 
@@ -419,6 +492,58 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
     return arguments->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
 }
 
+kern_return_t iSCSIKitDext::DaemonListPending(uint64_t minAgeMs,
+                                              IOUserClientMethodArguments * arguments)
+{
+    // Pairs of (taskID, ageMs) for every slot still `pending` (queued, never
+    // dequeued) for at least minAgeMs: a task whose notification was lost.
+    // entries[0] = count, then count pairs. Fixed size, so the output is
+    // never empty (an empty OSData is not guaranteed to be creatable).
+    uint64_t entries[1 + 2 * kMaxTaskCount] = {};
+    uint32_t count = 0;
+    uint64_t now = nowNs();
+    IOLockLock(ivars->lock);
+    for (auto & slot : ivars->slots) {
+        if (slot.state != SlotState::pending) {
+            continue;
+        }
+        uint64_t ageMs = now > slot.queuedAtNs ? (now - slot.queuedAtNs) / 1000000 : 0;
+        if (ageMs >= minAgeMs) {
+            entries[1 + 2 * count] = slot.task.fControllerTaskIdentifier;
+            entries[2 + 2 * count] = ageMs;
+            count++;
+        }
+    }
+    ivars->statListPendingReported += count;
+    IOLockUnlock(ivars->lock);
+    if (count > 0) {
+        LOG("%u task(s) pending without dequeue for >= %llu ms", count, minAgeMs);
+    }
+
+    // 1 Hz from the daemon: a cheap place to keep the registry counters fresh.
+    publishTaskStats(this, ivars);
+
+    entries[0] = count;
+    uint64_t totalLength = sizeof(entries);
+    if (arguments->structureOutputDescriptor) {
+        IOMemoryMap * map = nullptr;
+        kern_return_t ret = arguments->structureOutputDescriptor->CreateMapping(
+            0, 0, 0, 0, 0, &map);
+        if (ret != kIOReturnSuccess || !map) {
+            return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
+        }
+        if (map->GetLength() < totalLength) {
+            map->release();
+            return kIOReturnNoSpace;
+        }
+        memcpy(reinterpret_cast<void *>(map->GetAddress()), entries, totalLength);
+        map->release();
+        return kIOReturnSuccess;
+    }
+    arguments->structureOutput = OSData::withBytes(entries, totalLength);
+    return arguments->structureOutput ? kIOReturnSuccess : kIOReturnNoMemory;
+}
+
 kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t length)
 {
     if (length < sizeof(ISCSIKitTaskResponse)) {
@@ -460,7 +585,11 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     found->bufferAddress = 0;
     found->bufferLength = 0;
     found->state = SlotState::free_;
+    bool publishStats = (++ivars->statCompleted % 32) == 0;
     IOLockUnlock(ivars->lock);
+    if (publishStats) {
+        publishTaskStats(this, ivars);
+    }
 
     // Bytes the kernel may treat as transferred. For reads this is what was
     // actually copied into its buffer, never what the daemon announced; a
@@ -745,6 +874,7 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
         return kIOReturnNoResources;
     }
     slot->state = SlotState::pending;
+    slot->queuedAtNs = nowNs();
     slot->task = parallelRequest;
     completion->retain();
     slot->completion = completion;
@@ -885,6 +1015,14 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
         }
     }
     iSCSIKitUserClient * client = ivars->userClient;
+    uint64_t pendingNow = 0;
+    for (auto & candidate : ivars->slots) {
+        pendingNow += candidate.state == SlotState::pending;
+    }
+    if (pendingNow > ivars->statMaxPending) {
+        ivars->statMaxPending = pendingNow;
+    }
+    bool publishStats = (++ivars->statReceived % 32) == 0;
     bool isWrite = parallelRequest.fTransferDirection == kISCSIKitWrite &&
                    parallelRequest.fRequestedTransferCount > 0;
     IOLockUnlock(ivars->lock);
@@ -892,7 +1030,18 @@ kern_return_t IMPL(iSCSIKitDext, UserProcessParallelTask)
     if (isWrite) {
         publishWriteProbe(this, ivars);
     }
-    client->NotifyTaskPending(parallelRequest.fControllerTaskIdentifier);
+    bool notified = client->NotifyTaskPending(parallelRequest.fControllerTaskIdentifier);
+    IOLockLock(ivars->lock);
+    if (notified) {
+        ivars->statNotified++;
+    } else {
+        ivars->statNotifyFailed++;
+        publishStats = true;
+    }
+    IOLockUnlock(ivars->lock);
+    if (publishStats) {
+        publishTaskStats(this, ivars);
+    }
     *response = kSCSIServiceResponse_Request_In_Process;
     return kIOReturnSuccess;
 }

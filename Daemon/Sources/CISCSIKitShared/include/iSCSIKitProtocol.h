@@ -13,6 +13,10 @@
 #define ISCSIKIT_MAX_TRANSFER (1024 * 1024)
 
 #define ISCSIKIT_CDB_SIZE 16
+
+// Must match the dext's slot count (kMaxTaskCount).
+#define ISCSIKIT_MAX_TASKS 64
+#define ISCSIKIT_LIST_PENDING_BYTES ((1 + 2 * ISCSIKIT_MAX_TASKS) * 8)
 #define ISCSIKIT_SENSE_SIZE 256
 
 enum ISCSIKitSelector {
@@ -27,6 +31,11 @@ enum ISCSIKitSelector {
     kISCSIKitMethodDequeueTask = 3,
     // Struct in: ISCSIKitTaskResponse followed by dataIn payload for reads.
     kISCSIKitMethodCompleteTask = 4,
+    // Scalar in: minimum age in ms. Struct out: uint64_t count, then count
+    // pairs of uint64_t (taskID, ageMs), zero padded to
+    // ISCSIKIT_LIST_PENDING_BYTES, for tasks queued but never dequeued for that long,
+    // i.e. tasks whose "task pending" notification never reached the daemon.
+    kISCSIKitMethodListPending = 5,
 };
 
 enum ISCSIKitDirection {

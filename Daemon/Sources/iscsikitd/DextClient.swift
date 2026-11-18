@@ -123,6 +123,32 @@ final class DextClient {
         return (descriptor, payload)
     }
 
+    /// Tasks queued in the dext but never dequeued for at least `minAgeMs`:
+    /// their "task pending" notification never reached us.
+    func listPending(minAgeMs: UInt64) throws -> [(taskID: UInt64, ageMs: UInt64)] {
+        var input = [minAgeMs]
+        // Mirrors ISCSIKIT_LIST_PENDING_BYTES (a computed macro Swift cannot import).
+        let words = 1 + 2 * Int(ISCSIKIT_MAX_TASKS)
+        var buffer = [UInt64](repeating: 0, count: words)
+        var length = words * MemoryLayout<UInt64>.size
+        let ret = IOConnectCallMethod(
+            connection, UInt32(kISCSIKitMethodListPending.rawValue),
+            &input, 1,
+            nil, 0,
+            nil, nil,
+            &buffer, &length
+        )
+        guard ret == KERN_SUCCESS else { throw DextClientError.ioKit("ListPending", ret) }
+        let count = min(Int(buffer[0]), Int(ISCSIKIT_MAX_TASKS))
+        var result: [(taskID: UInt64, ageMs: UInt64)] = []
+        for index in 0..<count {
+            let taskID: UInt64 = buffer[1 + 2 * index]
+            let ageMs: UInt64 = buffer[2 + 2 * index]
+            result.append((taskID: taskID, ageMs: ageMs))
+        }
+        return result
+    }
+
     func completeTask(_ response: ISCSIKitTaskResponse, dataIn: Data) throws {
         var response = response
         var packet = Data(bytes: &response, count: MemoryLayout<ISCSIKitTaskResponse>.size)

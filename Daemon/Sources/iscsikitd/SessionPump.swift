@@ -136,6 +136,10 @@ final class SessionPump: @unchecked Sendable {
         var maxInFlight = 0
         var lastReport = Date()
     }
+    /// Tasks recovered by the stuck-task sweep (lost notifications); never
+    /// reset, so one recovery is not hidden by the next stats window.
+    private var stuckRecoveries = 0
+    private var stuckTimer: DispatchSourceTimer?
     private var stats = Stats()
     private var statsTimer: DispatchSourceTimer?
     private var dext: DextClient?
@@ -245,6 +249,14 @@ final class SessionPump: @unchecked Sendable {
             timer.setEventHandler { [weak self] in self?.reportStats() }
             timer.resume()
             statsTimer = timer
+
+            // Safety net for lost "task pending" notifications: once a
+            // second, ask the dext for tasks queued but never dequeued.
+            let stuck = DispatchSource.makeTimerSource(queue: queue)
+            stuck.schedule(deadline: .now() + 1, repeating: 1)
+            stuck.setEventHandler { [weak self] in self?.sweepStuckTasks() }
+            stuck.resume()
+            stuckTimer = stuck
         }
 
         // Register targets OFF the pump queue: UserCreateTargetForID blocks in
@@ -268,12 +280,45 @@ final class SessionPump: @unchecked Sendable {
     /// waiting for the answer, so up to the dext's slot count can be in
     /// flight on the wire at once; `finish` completes it when libiscsi calls
     /// back.
-    private func handleTask(_ taskID: UInt64) {
+    /// Recovers tasks that sit in the dext's `pending` state for over 2 s.
+    /// Dequeue only succeeds for pending slots, so this cannot double-run a
+    /// task the notification path already took.
+    private func sweepStuckTasks() {
         guard let dext else { return }
+        let stuck: [(taskID: UInt64, ageMs: UInt64)]
+        do {
+            stuck = try dext.listPending(minAgeMs: 2000)
+        } catch {
+            FileHandle.standardError.write(Data("stuck sweep failed: \(error)\n".utf8))
+            return
+        }
+        for entry in stuck {
+            stuckRecoveries += 1
+            print(String(format: "STUCK pending task %llu age %.1fs; recovering (total recoveries %d)",
+                         entry.taskID, Double(entry.ageMs) / 1000, stuckRecoveries))
+            handleTask(entry.taskID, recovering: true)
+        }
+    }
+
+    private func handleTask(_ taskID: UInt64, recovering: Bool = false) {
+        guard let dext else { return }
+        let dequeued: (ISCSIKitTaskDescriptor, Data)
         do {
             let t0 = Date()
-            let (descriptor, dataOut) = try dext.dequeueTask(taskID)
+            dequeued = try dext.dequeueTask(taskID)
             stats.dequeueSeconds += Date().timeIntervalSince(t0)
+        } catch where recovering {
+            // Not pending any more (or never was): nothing to recover, and
+            // failing it here could fail an in-flight task with the same id.
+            FileHandle.standardError.write(Data("STUCK task \(taskID) recovery dequeue failed: \(error)\n".utf8))
+            return
+        } catch {
+            FileHandle.standardError.write(Data("task \(taskID) failed: \(error)\n".utf8))
+            try? completeFailed(taskID: taskID, targetID: 0)
+            return
+        }
+        do {
+            let (descriptor, dataOut) = dequeued
             stats.tasks += 1
             guard let session = sessions[descriptor.targetID] else {
                 try completeFailed(taskID: taskID, targetID: descriptor.targetID)
@@ -408,9 +453,9 @@ final class SessionPump: @unchecked Sendable {
         let seconds = Date().timeIntervalSince(stats.lastReport)
         let perTaskDequeue = stats.dequeueSeconds / Double(stats.tasks) * 1000
         let perTaskComplete = stats.completeSeconds / Double(stats.tasks) * 1000
-        print(String(format: "pump: %d tasks in %.1fs (%.0f/s), dequeue %.2f ms + complete %.2f ms per task, max in flight %d",
+        print(String(format: "pump: %d tasks in %.1fs (%.0f/s), dequeue %.2f ms + complete %.2f ms per task, max in flight %d, stuck recoveries %d",
                      stats.tasks, seconds, Double(stats.tasks) / seconds,
-                     perTaskDequeue, perTaskComplete, stats.maxInFlight))
+                     perTaskDequeue, perTaskComplete, stats.maxInFlight, stuckRecoveries))
         stats = Stats()
     }
 

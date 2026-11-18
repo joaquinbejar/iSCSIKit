@@ -18,8 +18,9 @@ public:
                    OSObject * target,
                    void * reference) override;
 
-    // Called by the controller when a task lands in the queue.
-    virtual void NotifyTaskPending(uint64_t taskID) LOCALONLY;
+    // Called by the controller when a task lands in the queue. Returns false
+    // when the notification could not be sent (no callback registered).
+    virtual bool NotifyTaskPending(uint64_t taskID) LOCALONLY;
 };
 
 #endif /* iSCSIKitUserClient_h */

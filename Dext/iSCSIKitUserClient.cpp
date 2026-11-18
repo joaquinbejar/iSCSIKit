@@ -82,14 +82,25 @@ kern_return_t IMPL(iSCSIKitUserClient, Stop)
     return Stop(provider, SUPERDISPATCH);
 }
 
-void iSCSIKitUserClient::NotifyTaskPending(uint64_t taskID)
+bool iSCSIKitUserClient::NotifyTaskPending(uint64_t taskID)
 {
-    if (!ivars->pendingCallback) {
-        LOG("task %llu pending but no callback registered", taskID);
-        return;
+    // Runs on the controller's queue while RegisterCallback runs on the
+    // external-method queue: take a reference so a concurrent re-register
+    // cannot free the action under us.
+    OSAction * callback = ivars->pendingCallback;
+    if (!callback) {
+        // Dropped notification: the task stays pending until the daemon's
+        // ListPending sweep finds it.
+        LOG("task %llu pending but no callback registered (notification dropped)", taskID);
+        return false;
     }
+    callback->retain();
     uint64_t asyncData[1] = { taskID };
-    AsyncCompletion(ivars->pendingCallback, kIOReturnSuccess, asyncData, 1);
+    // AsyncCompletion returns void: a mach send failure in the kernel
+    // (sendAsyncResult64) is invisible here, so it cannot be counted.
+    AsyncCompletion(callback, kIOReturnSuccess, asyncData, 1);
+    callback->release();
+    return true;
 }
 
 kern_return_t iSCSIKitUserClient::ExternalMethod(uint64_t selector,
@@ -134,6 +145,12 @@ kern_return_t iSCSIKitUserClient::ExternalMethod(uint64_t selector,
             return kIOReturnBadArgument;
         }
         return ivars->controller->DaemonDequeueTask(arguments->scalarInput[0], arguments);
+
+    case kISCSIKitMethodListPending:
+        if (arguments->scalarInputCount < 1) {
+            return kIOReturnBadArgument;
+        }
+        return ivars->controller->DaemonListPending(arguments->scalarInput[0], arguments);
 
     case kISCSIKitMethodCompleteTask: {
         // Large inputs arrive as an IOMemoryDescriptor, small ones as OSData.
