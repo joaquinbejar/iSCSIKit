@@ -357,8 +357,10 @@ final class SessionPump: @unchecked Sendable {
             response.taskID = taskID
             response.targetID = targetID
             response.status = result.status
+            // Bytes sent are not bytes written: a write counts only what the
+            // target accepted, i.e. nothing unless GOOD, minus its residual.
             response.bytesTransferred = direction == .write
-                ? UInt64(bytesOut)
+                ? (result.status == 0 ? UInt64(max(0, bytesOut - result.residual)) : 0)
                 : UInt64(result.dataIn.count)
             withUnsafeMutableBytes(of: &response.sense) { senseBuffer in
                 let count = min(result.sense.count, senseBuffer.count)

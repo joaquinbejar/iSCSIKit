@@ -383,10 +383,14 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
     }
     memcpy(bytes, &descriptor, sizeof(descriptor));
 
-    if (payloadLength > 0 && found->staged != nullptr) {
-        uint64_t copyLength = payloadLength < found->stagedLength
-            ? payloadLength : found->stagedLength;
-        memcpy(bytes + sizeof(descriptor), found->staged, copyLength);
+    if (payloadLength > 0) {
+        // A write must reach the daemon whole or not at all. Failing here
+        // leaves the slot in flight; the daemon then completes it as failed.
+        if (found->staged == nullptr || found->stagedLength < payloadLength) {
+            IOFree(bytes, totalLength);
+            return kIOReturnUnderrun;
+        }
+        memcpy(bytes + sizeof(descriptor), found->staged, payloadLength);
     }
 
     // Large outputs arrive as an IOMemoryDescriptor to fill; small ones as
@@ -400,8 +404,12 @@ kern_return_t iSCSIKitDext::DaemonDequeueTask(uint64_t taskID,
             return ret != kIOReturnSuccess ? ret : kIOReturnNoMemory;
         }
         uint64_t mapLength = map->GetLength();
-        uint64_t copyLength = totalLength < mapLength ? totalLength : mapLength;
-        memcpy(reinterpret_cast<void *>(map->GetAddress()), bytes, copyLength);
+        if (mapLength < totalLength) {
+            map->release();
+            IOFree(bytes, totalLength);
+            return kIOReturnNoSpace;
+        }
+        memcpy(reinterpret_cast<void *>(map->GetAddress()), bytes, totalLength);
         map->release();
         IOFree(bytes, totalLength);
         return kIOReturnSuccess;
@@ -454,6 +462,19 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     found->state = SlotState::free_;
     IOLockUnlock(ivars->lock);
 
+    // Bytes the kernel may treat as transferred. For reads this is what was
+    // actually copied into its buffer, never what the daemon announced; a
+    // read that could not be delivered is reported as a failure.
+    uint64_t requested = task.fRequestedTransferCount;
+    uint64_t delivered = reply.bytesTransferred < requested ? reply.bytesTransferred : requested;
+    bool deliveryFailed = false;
+    if (task.fTransferDirection == kISCSIKitRead) {
+        delivered = 0;
+        if (reply.bytesTransferred > 0 && bufferAddress == 0) {
+            deliveryFailed = true;
+        }
+    }
+
     // Read data comes back inline after the response header; copy it into
     // the task's buffer mapped when the task was queued.
     if (task.fTransferDirection == kISCSIKitRead && reply.bytesTransferred > 0 &&
@@ -465,9 +486,16 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
             LOG("task %llu: read data %llu bytes truncated to buffer %llu",
                 reply.taskID, dataLength, bufferLength);
         }
+        if (copyLength > requested) {
+            copyLength = requested;
+        }
         memcpy(reinterpret_cast<void *>(bufferAddress),
                reinterpret_cast<const uint8_t *>(bytes) + sizeof(ISCSIKitTaskResponse),
                copyLength);
+        delivered = copyLength;
+        if (copyLength < reply.bytesTransferred && copyLength < requested) {
+            deliveryFailed = true;
+        }
     }
     OSSafeReleaseNULL(map);
     OSSafeReleaseNULL(buffer);
@@ -477,11 +505,12 @@ kern_return_t iSCSIKitDext::DaemonCompleteTask(const void * bytes, uint64_t leng
     response.fTargetID = task.fTargetID;
     response.fControllerTaskIdentifier = reply.taskID;
     response.fCompletionStatus = static_cast<SCSITaskStatus>(reply.status);
-    response.fServiceResponse = kSCSIServiceResponse_TASK_COMPLETE;
-    // Never report more than the kernel asked for: an over-count is passed
-    // straight up to the syscall as a byte count larger than the request.
-    response.fBytesTransferred = reply.bytesTransferred < task.fRequestedTransferCount
-        ? reply.bytesTransferred : task.fRequestedTransferCount;
+    response.fServiceResponse = deliveryFailed
+        ? kSCSIServiceResponse_SERVICE_DELIVERY_OR_TARGET_FAILURE
+        : kSCSIServiceResponse_TASK_COMPLETE;
+    // Never more than requested nor more than delivered: the count is passed
+    // straight up to the syscall.
+    response.fBytesTransferred = deliveryFailed ? 0 : delivered;
     // senseLength is uint8_t, so it always fits kMaxSenseBufferSize (256).
     response.fSenseLength = reply.senseLength;
     memcpy(response.fSenseBuffer, reply.sense, reply.senseLength);

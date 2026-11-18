@@ -215,6 +215,8 @@ public final class Initiator {
         public let status: UInt8
         public let dataIn: Data
         public let sense: Data
+        /// Bytes the target reported it did not transfer (underflow residual).
+        public let residual: Int
     }
 
     /// Executes an arbitrary CDB against the logged-in session. This is the
@@ -275,7 +277,9 @@ public final class Initiator {
             fixed[13] = UInt8(truncatingIfNeeded: task.pointee.sense.ascq & 0xFF)
             sense = Data(fixed)
         }
-        return RawResult(status: status, dataIn: dataIn, sense: sense)
+        return RawResult(status: status, dataIn: dataIn, sense: sense,
+                         residual: task.pointee.residual_status == SCSI_RESIDUAL_UNDERFLOW
+                             ? Int(task.pointee.residual) : 0)
     }
 
     // MARK: - Asynchronous execution
