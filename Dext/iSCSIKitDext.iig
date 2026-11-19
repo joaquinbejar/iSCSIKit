@@ -23,6 +23,10 @@ public:
     virtual kern_return_t DaemonDequeueTask(uint64_t taskID,
                                             IOUserClientMethodArguments * arguments) LOCALONLY;
     virtual kern_return_t DaemonCompleteTask(const void * bytes, uint64_t length) LOCALONLY;
+    virtual kern_return_t DaemonReadEvents(uint64_t startIndex,
+                                           IOUserClientMethodArguments * arguments) LOCALONLY;
+    virtual kern_return_t DaemonListPending(uint64_t minAgeMs,
+                                            IOUserClientMethodArguments * arguments) LOCALONLY;
 
     // Completion routine type definitions.
     virtual void

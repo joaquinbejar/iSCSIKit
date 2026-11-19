@@ -1,0 +1,19 @@
+Kernel panic 2026-11-18 on macOS 27.2.1 (26B131), dext build 35, during
+`diskutil eraseDisk APFS TEST /dev/disk4` on the disposable 16 GiB LUN,
+right after MS-DOS/MBR formatting of the same LUN had succeeded.
+
+panic(cpu 6 caller 0xfffffe00545af1e0): watchdog timeout: no checkins from watchdogd in 94 seconds
+Kernel version: Darwin Kernel Version 27.2.0: xnu-13432.41.4~25/RELEASE_ARM64_T6050
+Backtrace kexts: com.apple.driver.AppleARMWatchdogTimer, AppleInterruptControllerV3 (the
+watchdog itself; no storage kext in the panicking thread). Post-boot kexts include
+com.apple.iokit.IOSCSIParallelFamily. Stackshot incomplete.
+
+Daemon trace at the time: 3954 commands issued, 3954 completed (every one
+GOOD except one INQUIRY VPD 0x89), up to 4 in flight, writes carrying real
+data. The trace ends with all completions returned and the pump idle.
+
+Interpretation (unconfirmed): unlike the 2026-09-19 panic this is not memory
+corruption but a hang: userspace (watchdogd) was starved for 94 s. Every
+command that reached the daemon completed, so if an I/O was stuck it was
+one the daemon never saw (a task queued in the dext whose notification was
+lost, or the kernel blocked elsewhere) while the APFS erase held locks.

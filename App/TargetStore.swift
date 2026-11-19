@@ -32,7 +32,8 @@ final class TargetStore: ObservableObject {
         } else {
             targets = []
         }
-        save()
+        // No save() here: launching the app must not rewrite a daemon config
+        // edited outside the UI. The file is written only on real changes.
     }
 
     func add(name: String, url: String, mutualUsername: String? = nil,
@@ -61,19 +62,26 @@ final class TargetStore: ObservableObject {
             var mutualUsername: String?
             var mutualPassword: String?
         }
-        struct Config: Codable { var targets: [Entry] }
 
-        let config = Config(targets: targets.map {
+        let path = Self.configPath
+        let entries = targets.map {
             Entry(name: $0.name, url: $0.url,
                   mutualUsername: $0.mutualUsername, mutualPassword: $0.mutualPassword)
-        })
-        let path = Self.configPath
+        }
         do {
             try FileManager.default.createDirectory(
                 at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
-            let encoder = JSONEncoder()
-            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-            try encoder.encode(config).write(to: path, options: .atomic)
+            // Preserve keys the UI does not manage (allowWrites, traceTasks…).
+            var root: [String: Any] = [:]
+            if let existing = try? Data(contentsOf: path),
+               let object = try? JSONSerialization.jsonObject(with: existing) as? [String: Any] {
+                root = object
+            }
+            let encoded = try JSONEncoder().encode(entries)
+            root["targets"] = try JSONSerialization.jsonObject(with: encoded)
+            let data = try JSONSerialization.data(withJSONObject: root,
+                                                  options: [.prettyPrinted, .sortedKeys])
+            try data.write(to: path, options: .atomic)
         } catch {
             NSLog("iSCSIKit: failed to write daemon config: \(error)")
         }
